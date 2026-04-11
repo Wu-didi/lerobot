@@ -1306,23 +1306,43 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        # Training-Time RTC: pass previous chunk's unexecuted tail as frozen prefix
-        # - inference_delay = chunk_size - n_action_steps (# of tokens not yet executed from prev chunk)
-        # - prev_chunk is temporally shifted so its first inference_delay tokens align with the
-        #   new chunk's first inference_delay positions (= old_chunk[n_action_steps:])
-        if self.config.training_rtc and self._prev_action_chunk is not None:
-            inference_delay = self.config.chunk_size - self.config.n_action_steps
-            if inference_delay > 0:
-                # Shift old chunk left by n_action_steps; pad remaining positions with zeros (they won't be read)
+        # Training-Time RTC inference (opt-in):
+        # - Training only covers delays in {0, 1, ..., simulated_delay - 1} (see forward()).
+        # - To stay within the training distribution, the user must EXPLICITLY pass
+        #   `training_rtc_inference_delay` via kwargs. Values larger than `simulated_delay - 1`
+        #   are capped with a warning.
+        # - The previous chunk (stored internally) is shifted left by `n_action_steps` so
+        #   that its first `delay` tokens align with the new chunk's first `delay` positions.
+        # - If the user does not pass the kwarg, no hard replacement happens at inference
+        #   (training_rtc then only affects training; standard denoising is used at inference).
+        user_td = kwargs.pop("training_rtc_inference_delay", 0)
+        if (
+            self.config.training_rtc
+            and self._prev_action_chunk is not None
+            and user_td is not None
+            and user_td > 0
+        ):
+            max_td = self.config.simulated_delay - 1
+            if user_td > max_td:
+                logging.warning(
+                    "training_rtc_inference_delay=%d exceeds simulated_delay-1=%d; "
+                    "capping to training distribution max.",
+                    user_td,
+                    max_td,
+                )
+                user_td = max_td
+            shift = self.config.n_action_steps
+            end = shift + user_td
+            if end <= self.config.chunk_size:
                 shifted_prev = torch.zeros_like(self._prev_action_chunk)
-                shifted_prev[:, :inference_delay] = self._prev_action_chunk[:, self.config.n_action_steps:]
+                shifted_prev[:, :user_td] = self._prev_action_chunk[:, shift:end]
                 kwargs["training_rtc_prev_chunk"] = shifted_prev
-                kwargs["training_rtc_delay"] = inference_delay
+                kwargs["training_rtc_delay"] = user_td
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
 
-        # Store full horizon chunk for next call's prefix
+        # Store full horizon chunk for next call's prefix (only if user opts into inference RTC)
         if self.config.training_rtc:
             self._prev_action_chunk = actions.detach().clone()
 
