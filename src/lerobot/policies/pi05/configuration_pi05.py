@@ -53,6 +53,10 @@ class PI05Config(PreTrainedConfig):
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
+    # --- Training-Time RTC (arXiv 2512.05964) ---
+    training_rtc: bool = False  # Enable training-time action conditioning for real-time chunking
+    simulated_delay: int = 5  # Max prefix delay K; delay sampled from {0,...,K-1} with exp weights
+
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,
         DEFAULT_IMAGE_SIZE,
@@ -114,6 +118,12 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.training_rtc:
+            if self.simulated_delay <= 0 or self.simulated_delay > self.chunk_size:
+                raise ValueError(
+                    f"simulated_delay must be in [1, {self.chunk_size}], got {self.simulated_delay}"
+                )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

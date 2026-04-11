@@ -735,9 +735,33 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
+        batch_size = actions.shape[0]
+        chunk_size = self.config.chunk_size
+        device = actions.device
+
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
+
+        # ---- Training-Time RTC: replace prefix with clean actions ----
+        if self.config.training_rtc:
+            K = self.config.simulated_delay
+            # Sample delay ∈ {0,...,K-1} with exp-decaying weights (smaller delays more likely)
+            w = torch.exp(torch.arange(K, device=device).flip(0).float())
+            w = w / w.sum()
+            delay = torch.multinomial(w.expand(batch_size, -1), num_samples=1).squeeze(-1)  # [B]
+
+            # mask[b,j] = True if j < delay[b] (frozen prefix)
+            token_indices = torch.arange(chunk_size, device=device).unsqueeze(0)  # [1, T]
+            rtc_mask = token_indices < delay.unsqueeze(1)  # [B, T]
+
+            # Replace frozen prefix tokens with clean actions (time=0 in PI05 convention)
+            x_t = torch.where(rtc_mask.unsqueeze(-1), actions, x_t)
+
+            # Store mask for loss computation in PI05Policy.forward()
+            self._training_rtc_mask = (~rtc_mask).unsqueeze(-1).float()  # [B, T, 1], 1=active, 0=frozen
+        else:
+            self._training_rtc_mask = None
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
@@ -826,10 +850,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         dt = -1.0 / num_steps
 
+        # Training-Time RTC inference: get prefix info from kwargs
+        training_rtc_prev_chunk = kwargs.get("training_rtc_prev_chunk")
+        training_rtc_delay = kwargs.get("training_rtc_delay", 0)
+
         x_t = noise
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+
+            # Training-Time RTC: hard-replace prefix with previous chunk's actions
+            if self.config.training_rtc and training_rtc_prev_chunk is not None and training_rtc_delay > 0:
+                mask = torch.arange(self.config.chunk_size, device=device).unsqueeze(0) < training_rtc_delay
+                x_t = torch.where(mask.unsqueeze(-1), training_rtc_prev_chunk, x_t)
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -1122,6 +1155,8 @@ class PI05Policy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        # Training-Time RTC: track previous action chunk for prefix conditioning at inference
+        self._prev_action_chunk = None
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1236,8 +1271,17 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
+        # Training-Time RTC: pass previous chunk as prefix for conditioning
+        if self.config.training_rtc and self._prev_action_chunk is not None:
+            kwargs["training_rtc_prev_chunk"] = self._prev_action_chunk
+            kwargs["training_rtc_delay"] = self.config.n_action_steps
+
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+
+        # Store full padded chunk for next call's prefix
+        if self.config.training_rtc:
+            self._prev_action_chunk = actions.detach().clone()
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1267,20 +1311,44 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
-        loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
-        }
+        # Training-Time RTC: apply masked loss (only on non-frozen tokens)
+        rtc_mask = self.model._training_rtc_mask if self.config.training_rtc else None
 
-        if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
-            loss_dict["loss"] = per_sample_loss.mean().item()
-            return per_sample_loss, loss_dict
+        if rtc_mask is not None:
+            # rtc_mask: [B, T, 1], 1=active, 0=frozen; truncate action dim to match
+            loss_dict = {
+                "loss_per_dim": (losses * rtc_mask).sum(dim=[0, 1]).detach().cpu()
+                / (rtc_mask.sum(dim=[0, 1]).clamp(min=1e-8)).detach().cpu(),
+            }
+            loss_dict["loss_per_dim"] = loss_dict["loss_per_dim"].numpy().tolist()
+
+            if reduction == "none":
+                # Per-sample masked mean over time and action dims
+                per_sample_loss = (losses * rtc_mask).sum(dim=(1, 2)) / (
+                    rtc_mask.sum(dim=(1, 2)) * original_action_dim + 1e-8
+                )
+                loss_dict["loss"] = per_sample_loss.mean().item()
+                return per_sample_loss, loss_dict
+            else:
+                loss = (losses * rtc_mask).sum() / (rtc_mask.sum() * original_action_dim + 1e-8)
+                loss_dict["loss"] = loss.item()
+                return loss, loss_dict
         else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
-            loss_dict["loss"] = loss.item()
-            return loss, loss_dict
+            # ---- Original path (unchanged) ----
+            loss_dict = {
+                "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            }
+
+            if reduction == "none":
+                # Return per-sample losses (B,) by averaging over time and action dims
+                per_sample_loss = losses.mean(dim=(1, 2))
+                loss_dict["loss"] = per_sample_loss.mean().item()
+                return per_sample_loss, loss_dict
+            else:
+                # Default: return scalar mean loss
+                loss = losses.mean()
+                loss_dict["loss"] = loss.item()
+                return loss, loss_dict
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""
