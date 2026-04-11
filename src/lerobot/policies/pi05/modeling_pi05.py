@@ -77,24 +77,32 @@ def get_safe_dtype(target_dtype, device_type):
     return target_dtype
 
 
-def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (exact copy)
+def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (generalized for per-token time)
     time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    """Computes sine-cosine positional embedding vectors for scalar positions.
+
+    Accepts `time` of shape `[B]` (global time, original behavior) or `[B, T]` (per-token time,
+    used by Training-Time RTC). Output shape is `[B, dim]` or `[B, T, dim]` respectively.
+    """
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    if time.ndim not in (1, 2):
+        raise ValueError(
+            f"The time tensor is expected to be of shape `(batch_size,)` or `(batch_size, seq_len)`, "
+            f"got shape {tuple(time.shape)}"
+        )
 
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
-    # Compute the outer product
-    scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    # Broadcast scaling_factor: [half_dim] with time: [B] or [B, T]
+    scaling_factor = 1.0 / period * 2 * math.pi  # [half_dim]
+    # time.unsqueeze(-1): [B, 1] or [B, T, 1]; result: [B, half_dim] or [B, T, half_dim]
+    sin_input = time.unsqueeze(-1) * scaling_factor
+    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1)
 
 
 def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
@@ -739,32 +747,44 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         chunk_size = self.config.chunk_size
         device = actions.device
 
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
-        # ---- Training-Time RTC: replace prefix with clean actions ----
+        # ---- Training-Time RTC: per-token time (arXiv 2512.05964) ----
         if self.config.training_rtc:
             K = self.config.simulated_delay
-            # Sample delay ∈ {0,...,K-1} with exp-decaying weights (smaller delays more likely)
+            # (a) Sample delay ∈ {0,...,K-1} with exp-decaying weights (smaller delays more likely)
             w = torch.exp(torch.arange(K, device=device).flip(0).float())
             w = w / w.sum()
             delay = torch.multinomial(w.expand(batch_size, -1), num_samples=1).squeeze(-1)  # [B]
 
-            # mask[b,j] = True if j < delay[b] (frozen prefix)
+            # (b) Per-token mask: True = frozen prefix
             token_indices = torch.arange(chunk_size, device=device).unsqueeze(0)  # [1, T]
             rtc_mask = token_indices < delay.unsqueeze(1)  # [B, T]
 
-            # Replace frozen prefix tokens with clean actions (time=0 in PI05 convention)
-            x_t = torch.where(rtc_mask.unsqueeze(-1), actions, x_t)
+            # (c) Per-token time: frozen tokens = 0 (clean, PI05 convention), others = sampled t
+            time_per_token = torch.where(
+                rtc_mask, torch.zeros_like(time.unsqueeze(1)), time.unsqueeze(1)
+            )  # [B, T]
 
-            # Store mask for loss computation in PI05Policy.forward()
-            self._training_rtc_mask = (~rtc_mask).unsqueeze(-1).float()  # [B, T, 1], 1=active, 0=frozen
+            # (d) Interpolate with per-token time:
+            # At time=0 (frozen): x_t = 0*noise + 1*actions = actions (clean) — automatic
+            # At time=t (non-frozen): x_t = t*noise + (1-t)*actions (normal interpolation)
+            time_expanded = time_per_token.unsqueeze(-1)  # [B, T, 1]
+            x_t = time_expanded * noise + (1 - time_expanded) * actions
+            u_t = noise - actions
+
+            # (e) Effective time for model forward: [B, T] per-token
+            effective_time = time_per_token
+
+            # Store loss mask for PI05Policy.forward(); 1=active (loss counted), 0=frozen (masked out)
+            self._training_rtc_mask = (~rtc_mask).unsqueeze(-1).float()  # [B, T, 1]
         else:
+            time_expanded = time[:, None, None]
+            x_t = time_expanded * noise + (1 - time_expanded) * actions
+            u_t = noise - actions
+            effective_time = time  # [B]
             self._training_rtc_mask = None
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, effective_time)
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -854,15 +874,30 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         training_rtc_prev_chunk = kwargs.get("training_rtc_prev_chunk")
         training_rtc_delay = kwargs.get("training_rtc_delay", 0)
 
+        # Pre-compute per-token mask for RTC (constant across denoising steps)
+        training_rtc_active = (
+            self.config.training_rtc and training_rtc_prev_chunk is not None and training_rtc_delay > 0
+        )
+        if training_rtc_active:
+            rtc_token_mask = (
+                torch.arange(self.config.chunk_size, device=device).unsqueeze(0) < training_rtc_delay
+            )  # [1, T]
+
         x_t = noise
         for step in range(num_steps):
             time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
-
-            # Training-Time RTC: hard-replace prefix with previous chunk's actions
-            if self.config.training_rtc and training_rtc_prev_chunk is not None and training_rtc_delay > 0:
-                mask = torch.arange(self.config.chunk_size, device=device).unsqueeze(0) < training_rtc_delay
-                x_t = torch.where(mask.unsqueeze(-1), training_rtc_prev_chunk, x_t)
+            if training_rtc_active:
+                # Hard-replace prefix x_t with previous chunk's actions (clean)
+                x_t = torch.where(rtc_token_mask.unsqueeze(-1), training_rtc_prev_chunk, x_t)
+                # Build per-token time: frozen = 0 (clean, PI05 convention), others = current t
+                time_tensor = torch.full(
+                    (bsize, self.config.chunk_size), time, dtype=torch.float32, device=device
+                )
+                time_tensor = torch.where(
+                    rtc_token_mask.expand(bsize, -1), torch.zeros_like(time_tensor), time_tensor
+                )  # [B, T]
+            else:
+                time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -1271,15 +1306,23 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        # Training-Time RTC: pass previous chunk as prefix for conditioning
+        # Training-Time RTC: pass previous chunk's unexecuted tail as frozen prefix
+        # - inference_delay = chunk_size - n_action_steps (# of tokens not yet executed from prev chunk)
+        # - prev_chunk is temporally shifted so its first inference_delay tokens align with the
+        #   new chunk's first inference_delay positions (= old_chunk[n_action_steps:])
         if self.config.training_rtc and self._prev_action_chunk is not None:
-            kwargs["training_rtc_prev_chunk"] = self._prev_action_chunk
-            kwargs["training_rtc_delay"] = self.config.n_action_steps
+            inference_delay = self.config.chunk_size - self.config.n_action_steps
+            if inference_delay > 0:
+                # Shift old chunk left by n_action_steps; pad remaining positions with zeros (they won't be read)
+                shifted_prev = torch.zeros_like(self._prev_action_chunk)
+                shifted_prev[:, :inference_delay] = self._prev_action_chunk[:, self.config.n_action_steps:]
+                kwargs["training_rtc_prev_chunk"] = shifted_prev
+                kwargs["training_rtc_delay"] = inference_delay
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
 
-        # Store full padded chunk for next call's prefix
+        # Store full horizon chunk for next call's prefix
         if self.config.training_rtc:
             self._prev_action_chunk = actions.detach().clone()
 

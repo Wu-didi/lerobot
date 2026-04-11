@@ -120,8 +120,11 @@ class PiGemmaRMSNorm(nn.Module):
             return normed.type_as(x), None
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected cond dim {self.cond_dim}, got {cond.shape[-1]}")
+        # cond: [B, cond_dim] (global) or [B, T, cond_dim] (per-token, for training-time RTC)
         modulation = self.dense(cond)
-        if len(x.shape) == 3:
+        # If x is 3D [B, seq, dim] and cond is 2D (global), unsqueeze modulation to broadcast over seq
+        # If cond is already 3D (per-token), modulation is [B, seq, 3*dim] and aligns with x token-wise
+        if len(x.shape) == 3 and modulation.ndim == 2:
             modulation = modulation.unsqueeze(1)
         scale, shift, gate = modulation.chunk(3, dim=-1)
         normed = normed * (1 + scale.float()) + shift.float()
