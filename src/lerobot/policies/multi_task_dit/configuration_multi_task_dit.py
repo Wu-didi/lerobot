@@ -60,10 +60,6 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     timestep_sampling_alpha: float = 1.5  # (beta only) Beta distribution alpha
     timestep_sampling_beta: float = 1.0  # (beta only) Beta distribution beta
 
-    # --- Training-Time RTC (arXiv 2512.05964) ---
-    training_rtc: bool = False  # Enable training-time action conditioning for real-time chunking
-    simulated_delay: int = 5  # Max prefix delay K; delay sampled from {0,...,K-1} with exp weights
-
     # Transformer Architecture
     hidden_dim: int = 512  # Transformer hidden dimension
     num_layers: int = 6  # Number of transformer layers
@@ -193,11 +189,6 @@ class MultiTaskDiTConfig(PreTrainedConfig):
                     raise ValueError("timestep_sampling_alpha must be positive")
                 if self.timestep_sampling_beta <= 0:
                     raise ValueError("timestep_sampling_beta must be positive")
-            if self.training_rtc:
-                if self.simulated_delay <= 0 or self.simulated_delay > self.horizon:
-                    raise ValueError(
-                        f"simulated_delay must be in [1, {self.horizon}], got {self.simulated_delay}"
-                    )
 
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(

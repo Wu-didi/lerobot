@@ -124,20 +124,7 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
         assert n_obs_steps == self.config.n_obs_steps
 
         conditioning_vec = self.observation_encoder.encode(batch)
-
-        # Training-Time RTC: pass previous chunk as prefix for conditioning
-        rtc_kwargs = {}
-        if self.config.training_rtc and self._prev_action_chunk is not None:
-            rtc_kwargs["prev_action_chunk"] = self._prev_action_chunk
-            rtc_kwargs["inference_delay"] = self.config.n_action_steps
-
-        actions = self.objective.conditional_sample(
-            self.noise_predictor, batch_size, conditioning_vec, **rtc_kwargs
-        )
-
-        # Store full horizon chunk for next call's prefix
-        if self.config.training_rtc:
-            self._prev_action_chunk = actions.detach().clone()
+        actions = self.objective.conditional_sample(self.noise_predictor, batch_size, conditioning_vec)
 
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
@@ -153,9 +140,6 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
-
-        # Training-Time RTC: track previous action chunk for prefix conditioning at inference
-        self._prev_action_chunk = None
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -410,7 +394,7 @@ class SinusoidalPosEmb(nn.Module):
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x.unsqueeze(-1) * emb
+        emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
@@ -541,40 +525,22 @@ class TransformerBlock(nn.Module):
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(num_features, 6 * hidden_size, bias=True))
 
     def forward(self, x: Tensor, features: Tensor) -> Tensor:
-        # features: [B, cond_dim] (scalar time) or [B, T, cond_dim] (per-token time for training-time RTC)
-        # chunk along last dim so it works for both 2D and 3D tensors
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
             features
-        ).chunk(6, dim=-1)
+        ).chunk(6, dim=1)
 
-        if features.ndim == 3:
-            # Per-token conditioning: already [B, T, hidden], no unsqueeze needed
-            attn_input = modulate(self.norm1(x), shift_msa, scale_msa)
+        attn_input = modulate(self.norm1(x), shift_msa.unsqueeze(1), scale_msa.unsqueeze(1))
 
-            if self.use_rope:
-                attn_out = self.attn(attn_input)
-            else:
-                attn_out, _ = self.multihead_attn(attn_input, attn_input, attn_input)
-
-            x = x + gate_msa * attn_out
-
-            mlp_input = modulate(self.norm2(x), shift_mlp, scale_mlp)
-            mlp_out = self.mlp(mlp_input)
-            x = x + gate_mlp * mlp_out
+        if self.use_rope:
+            attn_out = self.attn(attn_input)
         else:
-            # Original path: scalar time [B, hidden], unsqueeze to broadcast across T
-            attn_input = modulate(self.norm1(x), shift_msa.unsqueeze(1), scale_msa.unsqueeze(1))
+            attn_out, _ = self.multihead_attn(attn_input, attn_input, attn_input)
 
-            if self.use_rope:
-                attn_out = self.attn(attn_input)
-            else:
-                attn_out, _ = self.multihead_attn(attn_input, attn_input, attn_input)
+        x = x + gate_msa.unsqueeze(1) * attn_out
 
-            x = x + gate_msa.unsqueeze(1) * attn_out
-
-            mlp_input = modulate(self.norm2(x), shift_mlp.unsqueeze(1), scale_mlp.unsqueeze(1))
-            mlp_out = self.mlp(mlp_input)
-            x = x + gate_mlp.unsqueeze(1) * mlp_out
+        mlp_input = modulate(self.norm2(x), shift_mlp.unsqueeze(1), scale_mlp.unsqueeze(1))
+        mlp_out = self.mlp(mlp_input)
+        x = x + gate_mlp.unsqueeze(1) * mlp_out
 
         return x
 
@@ -640,19 +606,8 @@ class DiffusionTransformer(nn.Module):
     def forward(self, x: Tensor, timestep: Tensor, conditioning_vec: Tensor) -> Tensor:
         _, seq_len, _ = x.shape
 
-        # timestep: [B] (scalar) or [B, T] (per-token for training-time RTC)
         timestep_features = self.time_mlp(timestep)
-        # timestep_features: [B, embed_dim] or [B, T, embed_dim]
-
-        if timestep.ndim == 2:
-            # Per-token time: expand conditioning_vec from [B, C] to [B, T, C] then concat
-            cond_features = torch.cat(
-                [timestep_features, conditioning_vec.unsqueeze(1).expand(-1, seq_len, -1)],
-                dim=-1,
-            )
-        else:
-            # Original path: scalar time
-            cond_features = torch.cat([timestep_features, conditioning_vec], dim=-1)
+        cond_features = torch.cat([timestep_features, conditioning_vec], dim=-1)
 
         hidden_seq = self.input_proj(x)
 
@@ -776,72 +731,24 @@ class FlowMatchingObjective(nn.Module):
     def compute_loss(self, model: nn.Module, batch: dict[str, Tensor], conditioning_vec: Tensor) -> Tensor:
         data = batch[ACTION]
         batch_size = data.shape[0]
-        horizon = data.shape[1]
         device = data.device
-        sigma_min = self.config.sigma_min
 
         noise = torch.randn_like(data)
         t = self._sample_timesteps(batch_size, device)
+        t_expanded = t.view(-1, 1, 1)
+        x_t = t_expanded * data + (1 - (1 - self.config.sigma_min) * t_expanded) * noise
 
-        if self.config.training_rtc:
-            # ---- Training-Time RTC (arXiv 2512.05964) ----
-            K = self.config.simulated_delay
+        target_velocity = data - (1 - self.config.sigma_min) * noise
+        predicted_velocity = model(x_t, t, conditioning_vec=conditioning_vec)
+        loss = F.mse_loss(predicted_velocity, target_velocity, reduction="none")
 
-            # (a) Sample delay ∈ {0,...,K-1} with exponentially decaying weights (smaller delays more likely)
-            w = torch.exp(torch.arange(K, device=device).flip(0).float())
-            w = w / w.sum()
-            delay = torch.multinomial(w.expand(batch_size, -1), num_samples=1).squeeze(-1)  # [B]
+        if self.do_mask_loss_for_padding and "action_is_pad" in batch:
+            valid_mask = ~batch["action_is_pad"]
+            loss = loss * valid_mask.unsqueeze(-1)
 
-            # (b) Construct per-token mask: mask[b,j] = True if j < delay[b] (frozen prefix)
-            token_indices = torch.arange(horizon, device=device).unsqueeze(0)  # [1, T]
-            mask = token_indices < delay.unsqueeze(1)  # [B, T]
+        return loss.mean()
 
-            # (c) Per-token time: frozen tokens get time=1.0, others get sampled t
-            t_per_token = torch.where(mask, torch.ones_like(t.unsqueeze(1)), t.unsqueeze(1))  # [B, T]
-
-            # (d) Interpolate with per-token time
-            te = t_per_token.unsqueeze(-1)  # [B, T, 1]
-            x_t = te * data + (1 - (1 - sigma_min) * te) * noise
-
-            # (e) Target velocity (same formula, independent of t)
-            target_velocity = data - (1 - sigma_min) * noise
-
-            # (f) Forward pass with per-token time [B, T]
-            predicted_velocity = model(x_t, t_per_token, conditioning_vec=conditioning_vec)
-
-            # (g) Loss only on unfrozen tokens
-            loss = F.mse_loss(predicted_velocity, target_velocity, reduction="none")  # [B, T, A]
-            loss_mask = (~mask).unsqueeze(-1).float()  # [B, T, 1]
-
-            if self.do_mask_loss_for_padding and "action_is_pad" in batch:
-                valid_mask = ~batch["action_is_pad"]
-                loss_mask = loss_mask * valid_mask.unsqueeze(-1).float()
-
-            return (loss * loss_mask).sum() / (loss_mask.sum() + 1e-8)
-
-        else:
-            # ---- Original flow matching path (unchanged) ----
-            t_expanded = t.view(-1, 1, 1)
-            x_t = t_expanded * data + (1 - (1 - sigma_min) * t_expanded) * noise
-
-            target_velocity = data - (1 - sigma_min) * noise
-            predicted_velocity = model(x_t, t, conditioning_vec=conditioning_vec)
-            loss = F.mse_loss(predicted_velocity, target_velocity, reduction="none")
-
-            if self.do_mask_loss_for_padding and "action_is_pad" in batch:
-                valid_mask = ~batch["action_is_pad"]
-                loss = loss * valid_mask.unsqueeze(-1)
-
-            return loss.mean()
-
-    def conditional_sample(
-        self,
-        model: nn.Module,
-        batch_size: int,
-        conditioning_vec: Tensor,
-        prev_action_chunk: Tensor | None = None,
-        inference_delay: int = 0,
-    ) -> Tensor:
+    def conditional_sample(self, model: nn.Module, batch_size: int, conditioning_vec: Tensor) -> Tensor:
         device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
 
@@ -850,81 +757,41 @@ class FlowMatchingObjective(nn.Module):
         num_steps = self.config.num_integration_steps
         time_grid = torch.linspace(0, 1, num_steps + 1, device=device)
 
-        # Training-Time RTC inference: pass prefix info to integration methods
-        rtc_kwargs = {}
-        if self.config.training_rtc and prev_action_chunk is not None and inference_delay > 0:
-            rtc_kwargs = {"prev_action_chunk": prev_action_chunk, "inference_delay": inference_delay}
-
         if self.config.integration_method == "euler":
-            x = self._euler_integrate(model, x, time_grid, conditioning_vec, **rtc_kwargs)
+            x = self._euler_integrate(model, x, time_grid, conditioning_vec)
         elif self.config.integration_method == "rk4":
-            x = self._rk4_integrate(model, x, time_grid, conditioning_vec, **rtc_kwargs)
+            x = self._rk4_integrate(model, x, time_grid, conditioning_vec)
         else:
             raise ValueError(f"Unknown integration method: {self.config.integration_method}")
 
         return x
 
     def _euler_integrate(
-        self,
-        model: nn.Module,
-        x_init: Tensor,
-        time_grid: Tensor,
-        conditioning_vec: Tensor,
-        prev_action_chunk: Tensor | None = None,
-        inference_delay: int = 0,
+        self, model: nn.Module, x_init: Tensor, time_grid: Tensor, conditioning_vec: Tensor
     ) -> Tensor:
         x = x_init
         for i in range(len(time_grid) - 1):
             t_scalar = time_grid[i].item()
             dt = (time_grid[i + 1] - time_grid[i]).item()
-
-            if prev_action_chunk is not None and inference_delay > 0:
-                # Training-Time RTC: hard-replace prefix + per-token time
-                mask = torch.arange(self.horizon, device=x.device).unsqueeze(0) < inference_delay  # [1, T]
-                x = torch.where(mask.unsqueeze(-1), prev_action_chunk, x)
-                t_batch = torch.full((x.shape[0], self.horizon), t_scalar, dtype=x.dtype, device=x.device)
-                t_batch = torch.where(mask, torch.ones_like(t_batch), t_batch)  # [B, T]
-            else:
-                # Original path: scalar time
-                t_batch = torch.full((x.shape[0],), t_scalar, dtype=x.dtype, device=x.device)
-
+            t_batch = torch.full((x.shape[0],), t_scalar, dtype=x.dtype, device=x.device)
             with torch.no_grad():
                 velocity = model(x, t_batch, conditioning_vec=conditioning_vec)
             x = x + dt * velocity
         return x
 
     def _rk4_integrate(
-        self,
-        model: nn.Module,
-        x_init: Tensor,
-        time_grid: Tensor,
-        conditioning_vec: Tensor,
-        prev_action_chunk: Tensor | None = None,
-        inference_delay: int = 0,
+        self, model: nn.Module, x_init: Tensor, time_grid: Tensor, conditioning_vec: Tensor
     ) -> Tensor:
         x = x_init
 
-        def make_t_batch(x_val: Tensor, t_scalar: float) -> Tensor:
-            if prev_action_chunk is not None and inference_delay > 0:
-                mask = torch.arange(self.horizon, device=x_val.device).unsqueeze(0) < inference_delay
-                t_b = torch.full((x_val.shape[0], self.horizon), t_scalar, dtype=x_val.dtype, device=x_val.device)
-                return torch.where(mask, torch.ones_like(t_b), t_b)  # [B, T]
-            else:
-                return torch.full((x_val.shape[0],), t_scalar, dtype=x_val.dtype, device=x_val.device)
-
         def dynamics(x_val: Tensor, t_scalar: float) -> Tensor:
-            t_batch = make_t_batch(x_val, t_scalar)
+            t_batch = torch.full((x_val.shape[0],), t_scalar, dtype=x_val.dtype, device=x_val.device)
             with torch.no_grad():
                 return model(x_val, t_batch, conditioning_vec=conditioning_vec)
 
         for i in range(len(time_grid) - 1):
             t = time_grid[i].item()
             dt = (time_grid[i + 1] - time_grid[i]).item()
-
-            # Hard-replace prefix at start of each RK4 step
-            if prev_action_chunk is not None and inference_delay > 0:
-                mask = torch.arange(self.horizon, device=x.device).unsqueeze(0) < inference_delay
-                x = torch.where(mask.unsqueeze(-1), prev_action_chunk, x)
 
             k1 = dynamics(x, t)
             k2 = dynamics(x + dt * k1 / 2, t + dt / 2)
