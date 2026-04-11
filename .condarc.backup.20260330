@@ -1,0 +1,8 @@
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r/
+  - defaults
+show_channel_urls: true
+proxy_servers:
+  http: http://127.0.0.1:7890
+  https: http://127.0.0.1:7890
