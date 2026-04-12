@@ -1306,38 +1306,24 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        # Training-Time RTC inference (opt-in):
-        # - Training only covers delays in {0, 1, ..., simulated_delay - 1} (see forward()).
-        # - To stay within the training distribution, the user must EXPLICITLY pass
-        #   `training_rtc_inference_delay` via kwargs. Values larger than `simulated_delay - 1`
-        #   are capped with a warning.
-        # - The previous chunk (stored internally) is shifted left by `n_action_steps` so
-        #   that its first `delay` tokens align with the new chunk's first `delay` positions.
-        # - If the user does not pass the kwarg, no hard replacement happens at inference
-        #   (training_rtc then only affects training; standard denoising is used at inference).
-        user_td = kwargs.pop("training_rtc_inference_delay", 0)
-        if (
-            self.config.training_rtc
-            and self._prev_action_chunk is not None
-            and user_td is not None
-            and user_td > 0
-        ):
-            max_td = self.config.simulated_delay - 1
-            if user_td > max_td:
-                logging.warning(
-                    "training_rtc_inference_delay=%d exceeds simulated_delay-1=%d; "
-                    "capping to training distribution max.",
-                    user_td,
-                    max_td,
-                )
-                user_td = max_td
-            shift = self.config.n_action_steps
-            end = shift + user_td
-            if end <= self.config.chunk_size:
+        # Training-Time RTC inference:
+        # When training_rtc=True and chunk_size > n_action_steps (temporal overlap), the
+        # previous chunk's unexecuted tail is used as a frozen prefix for the new chunk.
+        # This is the core benefit of Training-Time RTC: prefix hard-replacement + per-token
+        # time, NO expensive pinv/VJP guidance — just a regular forward pass.
+        #
+        # The prefix length is capped at simulated_delay - 1 to stay within the training
+        # distribution (training only sees delays in {0, ..., simulated_delay - 1}).
+        # When chunk_size == n_action_steps (no overlap), this block is skipped.
+        if self.config.training_rtc and self._prev_action_chunk is not None:
+            overlap = self.config.chunk_size - self.config.n_action_steps
+            inference_delay = min(overlap, self.config.simulated_delay - 1)
+            if inference_delay > 0:
+                shift = self.config.n_action_steps
                 shifted_prev = torch.zeros_like(self._prev_action_chunk)
-                shifted_prev[:, :user_td] = self._prev_action_chunk[:, shift:end]
+                shifted_prev[:, :inference_delay] = self._prev_action_chunk[:, shift : shift + inference_delay]
                 kwargs["training_rtc_prev_chunk"] = shifted_prev
-                kwargs["training_rtc_delay"] = user_td
+                kwargs["training_rtc_delay"] = inference_delay
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
