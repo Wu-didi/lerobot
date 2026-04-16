@@ -11,16 +11,15 @@ lerobot-record   \
  --teleop.right_arm_port=/dev/ttyACM2   \
  --teleop.id=bimanual_leader   \
  --display_data=false   \
- --dataset.repo_id=wudi/fold_clothes_0401  \
+ --dataset.repo_id=wudi/fold_clothes_0415_offline  \
  --dataset.num_episodes=2500   \
  --dataset.single_task="Fold the T-shirt that's on the table."   \
- --dataset.root=data/fold_clothes_0401  \
- --dataset.reset_time_s=1   \
+ --dataset.root=data/fold_clothes_0415_offline_dagger  \
+ --dataset.reset_time_s=20   \
  --dataset.episode_time_s=2000   \
  --dataset.push_to_hub=false  \
- --dataset.vcodec=h264_nvenc   \
- --dataset.encoder_threads=16  \
- --dataset.streaming_encoding=false
+ --dataset.streaming_encoding=false \
+ --resume=true   
 #  --dagger=true
 
 

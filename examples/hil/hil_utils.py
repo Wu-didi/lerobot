@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared utilities for Human-in-the-Loop data collection scripts."""
+"""Human-in-the-Loop 数据采集脚本的共用工具。"""
 
 import logging
 import time
@@ -38,9 +38,24 @@ from lerobot.utils.robot_utils import precise_sleep
 
 logger = logging.getLogger(__name__)
 
+# 这个文件只放 HIL 采集里与策略推理解耦的公共工具：
+# 1. dataset 相关配置；
+# 2. 键盘事件状态机；
+# 3. reset 阶段的人机交互；
+# 4. 用于原样记录 action/observation 的 processor。
+
 
 @dataclass
 class HILDatasetConfig:
+    """描述 HIL 轨迹如何写入 LeRobotDataset。
+
+    这个配置由 `hil_collect` 在创建或恢复 `LeRobotDataset` 时使用，
+    主要控制采样频率、episode 时长/数量、图像视频编码以及 Hub 上传行为。
+    它不直接决定机器人控制逻辑。
+    """
+
+    # 这里基本是 LeRobotDataset.create/resume 会消费的参数集合。
+    # HIL 逻辑本身只关心 fps、episode 时长/条数，编码和上传参数则一路透传。
     repo_id: str
     single_task: str
     root: str | Path | None = None
@@ -62,24 +77,42 @@ class HILDatasetConfig:
 
 
 def teleop_has_motor_control(teleop: Teleoperator) -> bool:
-    """Check if teleoperator has motor control capabilities."""
+    """判断 teleop 是否支持“软件驱动对齐姿态”。
+
+    HIL 在人工接管前，最好先把 leader 设备移动到当前机器人姿态附近，
+    这样接管瞬间不会出现明显跳变。如果 teleop 缺少这些接口，脚本仍能运行，
+    只是无法自动完成这一步对齐。
+    """
     return all(hasattr(teleop, attr) for attr in ("enable_torque", "disable_torque", "write_goal_positions"))
 
 
 def teleop_disable_torque(teleop: Teleoperator) -> None:
-    """Disable teleop torque if supported."""
+    """尽力关闭 teleop 力矩，让操作者可以手动拨动 leader。
+
+    对这个脚本来说，关闭力矩通常意味着操作者能更轻松地摆动 teleop，
+    而不会和电机对抗。部分 teleop 实现不支持该接口，因此这里做成静默 no-op。
+    """
     if hasattr(teleop, "disable_torque"):
         teleop.disable_torque()
 
 
 def teleop_enable_torque(teleop: Teleoperator) -> None:
-    """Enable teleop torque if supported."""
+    """尽力重新打开 teleop 力矩。
+
+    它主要用于脚本想主动控制 teleop 姿态的场景，例如在人工接管前，
+    先把 leader 设备平滑地移动到目标关节位置。
+    """
     if hasattr(teleop, "enable_torque"):
         teleop.enable_torque()
 
 
 def teleop_smooth_move_to(teleop: Teleoperator, target_pos: dict, duration_s: float = 2.0, fps: int = 50):
-    """Smoothly move teleop to target position if motor control is available."""
+    """把 teleop 设备平滑移动到目标关节姿态。
+
+    这个函数主要服务于“控制权切换”场景：在人类接管前，把 leader 设备尽量
+    对齐到 follower 机器人当前姿态，避免接管瞬间出现大的动作跳变。
+    它只影响 teleop 硬件本身，不会向数据集写任何内容。
+    """
     if not teleop_has_motor_control(teleop):
         logger.warning("Teleop does not support motor control - cannot mirror robot position")
         return
@@ -93,6 +126,8 @@ def teleop_smooth_move_to(teleop: Teleoperator, target_pos: dict, duration_s: fl
         interp = {}
         for k in current:
             if k in target_pos:
+                # leader 设备按线性插值缓慢追到 follower 当前姿态，
+                # 避免人工接管瞬间出现突跳。
                 interp[k] = current[k] * (1 - t) + target_pos[k] * t
             else:
                 interp[k] = current[k]
@@ -101,7 +136,14 @@ def teleop_smooth_move_to(teleop: Teleoperator, target_pos: dict, duration_s: fl
 
 
 def init_keyboard_listener():
-    """Initialize keyboard listener with HIL controls."""
+    """创建键盘监听器，并初始化 HIL 共用事件状态。
+
+    返回 `(listener, events)` 二元组。监听器本身只负责把按键翻译成
+    `events` 里的标志位，不直接控制机器人，也不直接写数据。
+    真正的控制逻辑和记录逻辑都在 rollout/reset 循环里消费这些标志位。
+
+    在 headless 环境下会返回 `(None, events)`，这样脚本其余部分仍可运行。
+    """
     # 共享的状态机标志位。键盘监听器只负责改标志，真正的机器人运动、
     # 数据记录和清理逻辑都在 rollout 循环里执行。
     events = {
@@ -112,6 +154,9 @@ def init_keyboard_listener():
         "correction_active": False,
         "resume_policy": False,
         "in_reset": False,
+        # 这个标志位在不同阶段复用：
+        # - in_reset=True 时: 表示“开始下一条 episode”
+        # - rollout 暂停后: 表示“开始人工接管”
         "start_next_episode": False,
     }
 
@@ -121,6 +166,7 @@ def init_keyboard_listener():
 
     from pynput import keyboard
 
+    # on_press 只做“按键 -> 状态机标志位”的翻译层。
     def on_press(key):
         try:
             if events["in_reset"]:
@@ -170,7 +216,12 @@ def init_keyboard_listener():
 
 
 def make_identity_processors():
-    """Create identity processors for recording."""
+    """构造“什么都不做”的 processor，用来复用数据集特征定义流程。
+
+    HIL 记录阶段并不想在落盘前改写 action/observation，但它仍希望沿用
+    LeRobot 的标准 processor pipeline 接口，这样 dataset feature 的组织
+    方式就和系统其他部分保持一致。
+    """
     # 记录数据时仍然走 RobotProcessorPipeline，这样 dataset feature 的生成
     # 和真实预处理流水线保持同一套接口。
     teleop_proc = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
@@ -187,12 +238,24 @@ def make_identity_processors():
 
 
 def reset_loop(robot: Robot, teleop: Teleoperator, events: dict, fps: int):
-    """Reset period where human repositions environment."""
+    """执行 episode 之间的 reset 流程。
+
+    这个函数会暂停数据记录，把控制权交给操作者，让其把场景和机器人摆回
+    下一条 episode 的起始状态。它分成两个阶段：
+    1. 等待操作者确认进入 reset teleoperation。
+    2. 持续把 teleop 动作转发给机器人，直到操作者开始下一条 episode
+       或者停止整个采集。
+
+    这里产生的动作和观测都不会写入数据集。
+    """
     logger.info("[HIL] RESET")
 
     events["in_reset"] = True
     events["start_next_episode"] = False
 
+    # reset 分成两个子阶段：
+    # 1. 等待操作者确认进入 teleop reset；
+    # 2. 允许操作者直接驱动机器人把环境和机械臂摆到下一条 episode 的起点。
     obs = robot.get_observation()
     robot_pos = {k: v for k, v in obs.items() if k.endswith(".pos") and k in robot.observation_features}
     # 启用人工控制前，先把 teleop 设备移动到机器人当前姿态；
@@ -218,6 +281,8 @@ def reset_loop(robot: Robot, teleop: Teleoperator, events: dict, fps: int):
         robot.send_action(action)
         precise_sleep(1 / fps - (time.perf_counter() - loop_start))
 
+    # 离开 reset 前把 rollout 用到的瞬时状态全部清空，确保下一条 episode
+    # 以“策略控制、未暂停、未接管”的干净状态启动。
     events["in_reset"] = False
     events["start_next_episode"] = False
     events["exit_early"] = False
@@ -227,7 +292,11 @@ def reset_loop(robot: Robot, teleop: Teleoperator, events: dict, fps: int):
 
 
 def print_controls(rtc: bool = False):
-    """Print control instructions."""
+    """打印当前模式下的键盘控制说明。
+
+    sync 和 RTC 的按键集合基本一致；标题里是否带 `(RTC)` 只是提醒当前
+    策略动作由异步后台线程生成。
+    """
     mode = "Human-in-the-Loop Data Collection" + (" (RTC)" if rtc else "")
     logger.info(
         "%s\n  Controls:\n"

@@ -68,60 +68,78 @@ def update_policy(
     rabc_weights_provider=None,
 ) -> tuple[MetricsTracker, dict]:
     """
-    Performs a single training step to update the policy's weights.
+    执行一次完整的参数更新。
 
-    This function executes the forward and backward passes, clips gradients, and steps the optimizer and
-    learning rate scheduler. Accelerator handles mixed-precision training automatically.
+    这个函数是训练循环里真正“做反向传播”的核心步骤。它负责：
+    1. 把 policy 切到 train 模式。
+    2. 视情况计算 RA-BC 的样本权重。
+    3. 在 accelerator.autocast() 下执行前向，得到 loss。
+    4. 反向传播、梯度裁剪、optimizer.step()、scheduler.step()。
+    5. 把本 step 的 loss / grad_norm / lr / update 耗时写回指标对象。
+
+    这里故意把“单步更新”单独抽成函数，而不是全部塞进 train()：
+    - train() 负责流程编排：取 batch、日志、保存、评估。
+    - update_policy() 只负责“给定一个 batch，如何更新一次模型”。
+    这样读源码时，训练主循环会更清楚。
 
     Args:
-        train_metrics: A MetricsTracker instance to record training statistics.
-        policy: The policy model to be trained.
-        batch: A batch of training data.
-        optimizer: The optimizer used to update the policy's parameters.
-        grad_clip_norm: The maximum norm for gradient clipping.
-        accelerator: The Accelerator instance for distributed training and mixed precision.
-        lr_scheduler: An optional learning rate scheduler.
-        lock: An optional lock for thread-safe optimizer updates.
-        rabc_weights_provider: Optional RABCWeights instance for sample weighting.
+        train_metrics: 训练指标跟踪器。这个对象会在函数内部被原地更新。
+        policy: 当前要训练的策略模型。
+        batch: 经过 dataloader 取出、并且通常已经过 preprocessor 处理的一批数据。
+        optimizer: 优化器。
+        grad_clip_norm: 梯度裁剪阈值。<=0 时不做有限阈值裁剪，只统计总范数。
+        accelerator: accelerate 的统一封装，负责分布式、混精、反向传播等。
+        lr_scheduler: 学习率调度器，可选。
+        lock: 可选锁。当前文件里默认不用，但保留接口给更特殊的并发更新场景。
+        rabc_weights_provider: RA-BC 权重提供器。开启后会把 batch 内样本做加权。
 
     Returns:
-        A tuple containing:
-        - The updated MetricsTracker with new statistics for this step.
-        - A dictionary of outputs from the policy's forward pass, for logging purposes.
+        返回二元组：
+        - 更新后的 train_metrics
+        - policy 前向返回的 output_dict，主要给日志系统/W&B 继续记录
     """
     start_time = time.perf_counter()
     policy.train()
 
-    # Get RA-BC weights if enabled
+    # RA-BC 会根据 batch 中样本的进度/难度为每个样本生成一个权重。
+    # 如果没有启用，就保持 None，后面走普通平均 loss 的分支。
     rabc_batch_weights = None
     rabc_batch_stats = None
     if rabc_weights_provider is not None:
         rabc_batch_weights, rabc_batch_stats = rabc_weights_provider.compute_batch_weights(batch)
 
-    # Let accelerator handle mixed precision
+    # 所有前向都放在 accelerator.autocast() 里，让 accelerate 决定是否启用混精。
     with accelerator.autocast():
-        # Use per-sample loss when RA-BC is enabled for proper weighting
+        # 开启 RA-BC 时，不能直接拿“已经聚合好的平均 loss”。
+        # 必须让 policy 返回每个样本各自的 loss，再按权重重算加权平均。
         if rabc_batch_weights is not None:
-            # Get per-sample losses
+            # reduction="none" 代表保留每个样本单独的损失。
             per_sample_loss, output_dict = policy.forward(batch, reduction="none")
 
-            # Apply RA-BC weights: L_RA-BC = Σ(w_i * l_i) / (Σw_i + ε)
-            # rabc_batch_weights is already normalized to sum to batch_size
+            # RA-BC 的核心公式：
+            #   L = Σ(w_i * l_i) / (Σw_i + ε)
+            # 这里额外加 epsilon 只是为了数值稳定，避免极端情况下分母为 0。
+            # rabc_batch_weights 在 provider 内部通常已经做过归一化。
             epsilon = 1e-6
             loss = (per_sample_loss * rabc_batch_weights).sum() / (rabc_batch_weights.sum() + epsilon)
-            # Log raw mean weight (before normalization) - this is the meaningful metric
+            # 下面这些额外统计值不会参与训练，只是为了日志里能看到
+            # 当前 batch 的样本权重分布情况。
             output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
             output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
             output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
         else:
+            # 普通训练分支：policy 自己返回已经聚合好的 loss。
             loss, output_dict = policy.forward(batch)
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
-    # Use accelerator's backward method
+    # 统一通过 accelerator.backward() 做反向传播，这样在单卡/多卡/混精下
+    # 都走同一套接口。
     accelerator.backward(loss)
 
-    # Clip gradients if specified
+    # 梯度裁剪是训练稳定性的常见手段。
+    # grad_clip_norm > 0 时按给定阈值裁剪；
+    # 否则不裁剪，但仍然统计一个“无限阈值”下的总梯度范数，便于日志观测。
     if grad_clip_norm > 0:
         grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
     else:
@@ -129,20 +147,23 @@ def update_policy(
             policy.parameters(), float("inf"), error_if_nonfinite=False
         )
 
-    # Optimizer step
+    # 先 step，再 zero_grad，是 PyTorch 里最常见的更新顺序。
+    # lock 只是在需要线程安全时才生效，这个训练脚本默认不会传。
     with lock if lock is not None else nullcontext():
         optimizer.step()
 
     optimizer.zero_grad()
 
-    # Step through pytorch scheduler at every batch instead of epoch
+    # 这个训练脚本的 scheduler 是“按 batch / step 更新”，不是按 epoch 更新。
     if lr_scheduler is not None:
         lr_scheduler.step()
 
-    # Update internal buffers if policy has update method
+    # 某些 policy 除了参数外，还有内部缓存/统计量需要在 step 后刷新。
+    # 如果模型实现了 update()，这里会显式调用一次。
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
+    # 把本 step 的关键训练指标回填到 tracker。
     train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
@@ -153,32 +174,43 @@ def update_policy(
 @parser.wrap()
 def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     """
-    Main function to train a policy.
+    训练脚本主入口。
 
-    This function orchestrates the entire training pipeline, including:
-    - Setting up logging, seeding, and device configuration.
-    - Creating the dataset, evaluation environment (if applicable), policy, and optimizer.
-    - Handling resumption from a checkpoint.
-    - Running the main training loop, which involves fetching data batches and calling `update_policy`.
-    - Periodically logging metrics, saving model checkpoints, and evaluating the policy.
-    - Pushing the final trained model to the Hugging Face Hub if configured.
+    这个函数负责把“离线训练”完整串起来，核心流程是：
+    1. 校验配置，并构造 Accelerator。
+    2. 初始化日志、随机种子、设备。
+    3. 构造 dataset、可选 eval 环境、policy、processor、optimizer、scheduler。
+    4. 如有需要，从 checkpoint 恢复训练状态。
+    5. 构造 dataloader，进入主训练循环。
+    6. 周期性做日志输出、存 checkpoint、跑评估。
+    7. 训练结束后清理资源，并按配置把模型推到 Hub。
+
+    读这个文件时，可以把 train() 当成“总调度器”：
+    - 它不关心具体某个 policy 的内部细节。
+    - 它关心的是训练系统层面的编排：谁先初始化、谁只在主进程执行、
+      什么时候同步、什么时候保存和评估。
 
     Args:
-        cfg: A `TrainPipelineConfig` object containing all training configurations.
-        accelerator: Optional Accelerator instance. If None, one will be created automatically.
+        cfg: 完整训练配置。
+        accelerator: 可选的 Accelerator 实例；为空时函数内部自动创建。
     """
     cfg.validate()
 
-    # Create Accelerator if not provided
-    # It will automatically detect if running in distributed mode or single-process mode
-    # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
-    # We set find_unused_parameters=True to handle models with conditional computation
+    # 如果外部没有传 accelerator，就在这里创建。
+    # 这是整个脚本和 accelerate 集成的入口，后面的 device、DDP、混精、barrier
+    # 都依赖这个对象。
+    #
+    # 这里有两个细节：
+    # 1. step_scheduler_with_optimizer=False
+    #    代表学习率调度完全由本脚本自己控制，不让 accelerate 自动改 step 逻辑。
+    # 2. find_unused_parameters=True
+    #    允许 DDP 容忍某些分支条件下未参与计算图的参数，适配条件计算模型。
     if accelerator is None:
         from accelerate.utils import DistributedDataParallelKwargs
 
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
-        # Force the device to be CPU when policy.device is set to CPU.
+        # accelerate 默认会根据硬件自动选设备。
+        # 但如果配置里明确要求 policy.device == "cpu"，这里强制只用 CPU。
         force_cpu = cfg.policy.device == "cpu"
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
@@ -188,15 +220,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     init_logging(accelerator=accelerator)
 
-    # Determine if this is the main process (for logging and checkpointing)
-    # When using accelerate, only the main process should log to avoid duplicate outputs
+    # 多进程训练时，很多事情只应该由主进程做一次：
+    # 例如打印日志、初始化 wandb、保存 checkpoint、创建 eval 环境等。
     is_main_process = accelerator.is_main_process
 
-    # Only log on main process
+    # 打印完整配置通常只保留主进程一份，避免终端刷屏。
     if is_main_process:
         logging.info(pformat(cfg.to_dict()))
 
-    # Initialize wandb only on main process
+    # WandB 也只在主进程初始化，否则会创建重复 run。
     if cfg.wandb.enable and cfg.wandb.project and is_main_process:
         wandb_logger = WandBLogger(cfg)
     else:
@@ -207,7 +239,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.seed is not None:
         set_seed(cfg.seed, accelerator=accelerator)
 
-    # Use accelerator's device
+    # 后续所有张量和模型都应该围绕 accelerator.device 工作，
+    # 而不是自行猜测当前设备。
     device = accelerator.device
     if cfg.cudnn_deterministic:
         torch.backends.cudnn.deterministic = True
@@ -216,20 +249,26 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Dataset loading synchronization: main process downloads first to avoid race conditions
+    # 数据集的创建通常可能涉及下载、索引构建、缓存写入等副作用。
+    # 为避免多进程同时创建产生竞争，先让主进程单独做一遍。
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
 
+    # 主进程把数据准备好后，其余进程再继续。
     accelerator.wait_for_everyone()
 
-    # Now all other processes can safely load the dataset
+    # 此时其他进程再创建 dataset，就不会和主进程抢相同资源。
     if not is_main_process:
         dataset = make_dataset(cfg)
 
-    # Create environment used for evaluating checkpoints during training on simulation data.
-    # On real-world data, no need to create an environment as evaluations are done outside train.py,
-    # using the eval.py instead, with gym_dora environment and dora-rs.
+    # 训练过程中的在线评估环境只在以下条件下创建：
+    # - 配置了 eval_freq
+    # - 训练配置里提供了 env
+    # - 当前是主进程
+    #
+    # 对真实机器人数据，通常不会在 train.py 里直接起环境评估；
+    # 这部分一般由独立 eval 脚本完成。
     eval_env = None
     if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
         logging.info("Creating env")
@@ -237,6 +276,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Creating policy")
+    # policy 的构造依赖 dataset meta：
+    # 例如特征维度、统计量、episode 信息等。
     policy = make_policy(
         cfg=cfg.policy,
         ds_meta=dataset.meta,
@@ -245,25 +286,33 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")
-        # Convert CLI peft config to dict for overrides
+        # CLI 传进来的 dataclass 配置要先转成 dict，才能作为覆盖项传给 policy。
         peft_cli_overrides = dataclasses.asdict(cfg.peft)
         policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
 
-    # Wait for all processes to finish policy creation before continuing
+    # 某些后续逻辑会假设所有进程上的模型结构都已经构造完毕，因此这里同步一次。
     accelerator.wait_for_everyone()
 
-    # Create processors - only provide dataset_stats if not resuming from saved processors
+    # processor 负责把 dataset batch 转成 policy 真正需要的输入格式，
+    # 以及把 policy 输出再映射回规范化/反规范化后的格式。
+    #
+    # 这里要特别注意“是否恢复训练”的区别：
+    # - 如果是从已有 checkpoint/processor 状态恢复，尽量沿用保存下来的 processor 状态。
+    # - 如果是新训练，或者只是从预训练模型初始化，则使用当前 dataset 的统计量构造 processor。
     processor_kwargs = {}
     postprocessor_kwargs = {}
     if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
-        # Only provide dataset_stats when not resuming from saved processor state
+        # dataset_stats 决定了标准化/反标准化的尺度。
+        # 恢复训练时不在这里强灌一份新的 stats，是为了避免覆盖 checkpoint 里保存的处理器状态。
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
-    # For SARM, always provide dataset_meta for progress normalization
+    # SARM 除了统计量，还需要 dataset_meta 来处理 progress 相关的归一化。
     if cfg.policy.type == "sarm":
         processor_kwargs["dataset_meta"] = dataset.meta
 
     if cfg.policy.pretrained_path is not None:
+        # 从 pretrained_path 启动时，这里把和当前训练数据集相关的覆盖项传给 processor。
+        # 这样既能复用预训练模型结构，又能让输入/输出映射到当前数据集的字段和统计量上。
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
@@ -292,15 +341,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
+    # optimizer / scheduler 的具体类型由配置决定，这里只做工厂调用。
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
-    # Load precomputed SARM progress for RA-BC if enabled
-    # Generate progress using: src/lerobot/policies/sarm/compute_rabc_weights.py
+    # RA-BC 是一个可选训练增强逻辑。
+    # 它需要预先计算好的 progress 信息，训练时再把这个 progress 映射成 batch 权重。
     rabc_weights = None
     if cfg.use_rabc:
         from lerobot.utils.rabc import RABCWeights
 
-        # Get chunk_size from policy config
+        # RA-BC 依赖 chunk_size，因为它通常和 chunk/prediction horizon 的定义绑定。
         chunk_size = getattr(policy.config, "chunk_size", None)
         if chunk_size is None:
             raise ValueError("Chunk size is not found in policy config")
@@ -317,15 +367,21 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             device=device,
         )
 
-    step = 0  # number of policy updates (forward + backward + optim)
+    # step 表示已经做了多少次“参数更新”。
+    # 这里的定义不是 epoch，也不是看过多少条样本，而是 forward + backward + optimizer.step 的次数。
+    step = 0
 
     if cfg.resume:
+        # 恢复训练时，除了 step，还需要把 optimizer / scheduler 一起恢复，
+        # 否则学习率曲线和动量状态都会错位。
         step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
     if is_main_process:
+        # 下面这一组日志主要用于开训前做 sanity check：
+        # 看输出目录、环境任务、数据规模、有效 batch size、参数量是否符合预期。
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
         if cfg.env is not None:
             logging.info(f"{cfg.env.task=}")
@@ -342,7 +398,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # create dataloader for offline training
+    # 离线训练 dataloader：
+    # 某些 policy 会要求“一个 episode 的最后 N 帧不能被采样”，
+    # 例如因为要预测未来动作 chunk，尾部样本缺少足够上下文。
+    # 这时就改用 EpisodeAwareSampler，而不是普通 shuffle。
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(
@@ -367,15 +426,22 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
-    # Prepare everything with accelerator
+    # accelerate.prepare() 会根据当前运行模式，把对象包成对应形式：
+    # - policy 可能被包装成 DDP / mixed precision 版本
+    # - dataloader 可能被替换成分布式 sampler 驱动的版本
+    # 后面凡是要拿回原始模型，都必须用 accelerator.unwrap_model()。
     accelerator.wait_for_everyone()
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
+
+    # cycle() 把 dataloader 变成一个“无限迭代器”。
+    # 这样训练循环只关心 step 数，不关心 epoch 边界。
     dl_iter = cycle(dataloader)
 
     policy.train()
 
+    # AverageMeter 负责维护滑动统计；MetricsTracker 负责把这些统计组织成统一日志格式。
     train_metrics = {
         "loss": AverageMeter("loss", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
@@ -396,6 +462,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     )
 
     if is_main_process:
+        # 进度条只放在主进程显示，避免多进程互相覆盖终端输出。
         progbar = tqdm(
             total=cfg.steps - step,
             desc="Training",
@@ -408,9 +475,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    # 主训练循环：
+    # 每一轮做一件事：取一个 batch -> 预处理 -> 更新 policy -> 决定是否日志/保存/评估。
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
+
+        # preprocessor 负责字段改名、设备搬运、归一化等训练前准备。
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
@@ -425,8 +496,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             rabc_weights_provider=rabc_weights,
         )
 
-        # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
-        # increment `step` here.
+        # 这里先把 step +1，再判断是否保存/评估。
+        # 也就是说：
+        # - “step = 1000 的 checkpoint”
+        # - “step = 1000 的 eval”
+        # 都表示“第 1000 次参数更新已经完成之后”的状态。
         step += 1
         if is_main_process:
             progbar.update(1)
@@ -440,8 +514,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
+                    # 模型 forward 里返回的额外监控指标，例如各类辅助 loss、
+                    # RA-BC 统计等，也合并进 wandb 日志。
                     wandb_log_dict.update(output_dict)
-                # Log RA-BC statistics if enabled
+                # RA-BC 还有一组全局统计值，和当前 batch 的 output_dict 不完全重复。
                 if rabc_weights is not None:
                     rabc_stats = rabc_weights.get_stats()
                     wandb_log_dict.update(
@@ -452,6 +528,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         }
                     )
                 wandb_logger.log_dict(wandb_log_dict, step)
+
+            # 一次日志输出之后，把 AverageMeter 的累计窗口清掉，
+            # 下一个日志周期重新开始统计平均值。
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
@@ -472,12 +551,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 
+            # 保存完以后做一次 barrier，确保别的进程不会在主进程还没写完 checkpoint 时继续往前跑。
             accelerator.wait_for_everyone()
 
         if cfg.env and is_eval_step:
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
+
+                # 评估不需要梯度，但仍然允许 autocast，这样可以复用推理时的混精收益。
                 with torch.no_grad(), accelerator.autocast():
                     eval_info = eval_policy_all(
                         envs=eval_env,  # dict[suite][task_id] -> vec_env
@@ -492,14 +574,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
                     )
-                # overall metrics (suite-agnostic)
+
+                # overall 是跨 suite 聚合后的总指标，最适合做横向比较。
                 aggregated = eval_info["overall"]
 
-                # optional: per-suite logging
+                # 除了 overall，也保留每个 suite 的聚合结果，方便看不同任务组表现。
                 for suite, suite_info in eval_info.items():
                     logging.info("Suite %s aggregated: %s", suite, suite_info)
 
-                # meters/tracker
+                # 评估也复用 MetricsTracker，保持训练/评估两套日志格式尽量一致。
                 eval_metrics = {
                     "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
                     "pc_success": AverageMeter("success", ":.1f"),
@@ -519,8 +602,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 if wandb_logger:
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
+                    # 默认把 overall 的第一段视频同步到 wandb，便于快速人工查看策略表现。
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
+            # 评估结束后同步，避免主进程长时间 eval、其他进程已经继续训练导致步数错位。
             accelerator.wait_for_everyone()
 
     if is_main_process:
@@ -534,6 +619,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if cfg.policy.push_to_hub:
             unwrapped_policy = accelerator.unwrap_model(policy)
+            # PEFT 模型和普通模型推送 Hub 的接口不完全一样，所以分开处理。
             if cfg.policy.use_peft:
                 unwrapped_policy.push_model_to_hub(cfg, peft_model=unwrapped_policy)
             else:
@@ -541,12 +627,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             preprocessor.push_to_hub(cfg.policy.repo_id)
             postprocessor.push_to_hub(cfg.policy.repo_id)
 
-    # Properly clean up the distributed process group
+    # 训练结束前再做一次 barrier，确保所有进程都走到收尾阶段，再统一释放 accelerate 资源。
     accelerator.wait_for_everyone()
     accelerator.end_training()
 
 
 def main():
+    """CLI 入口：先注册第三方插件，再进入 train()。"""
     register_third_party_plugins()
     train()
 

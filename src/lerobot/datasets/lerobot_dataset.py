@@ -43,6 +43,21 @@ logger = logging.getLogger(__name__)
 
 
 class LeRobotDataset(torch.utils.data.Dataset):
+    """
+    LeRobot 数据集的统一门面类。
+
+    这个类把数据集系统拆成三块：
+    - metadata：描述数据集结构、全局统计量、任务表、episode 边界等
+    - reader：负责训练/评估时按索引随机读取样本
+    - writer：负责录制/转换时顺序写入 frame 和 episode
+
+    从使用方式看，它支持两种状态：
+    - 只读模式：通过 ``LeRobotDataset(...)`` 打开一个已经存在的数据集
+    - 写模式：通过 ``create()`` 或 ``resume()`` 得到一个可追加数据的对象
+
+    外部代码通常只和 LeRobotDataset 交互，不直接操作 reader / writer。
+    """
+
     def __init__(
         self,
         repo_id: str,
@@ -62,132 +77,40 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_threads: int | None = None,
     ):
         """
-        2 modes are available for instantiating this class, depending on 2 different use cases:
+        打开一个已经存在的数据集。
 
-        1. Your dataset already exists:
-            - On your local disk in the 'root' folder. This is typically the case when you recorded your
-              dataset locally and you may or may not have pushed it to the hub yet. Instantiating this class
-              with 'root' will load your dataset directly from disk. This can happen while you're offline (no
-              internet connection).
+        这是训练和评估最常用的构造入口。它会先加载 metadata，再构造 reader，
+        然后优先尝试使用本地缓存；如果本地数据不完整，再从 Hugging Face Hub 下载。
 
-            - On the Hugging Face Hub at the address https://huggingface.co/datasets/{repo_id} and not on
-              your local disk in the 'root' folder. Instantiating this class with this 'repo_id' will download
-              the dataset from that address and load it, pending your dataset is compliant with
-              codebase_version v3.0. If your dataset has been created before this new format, you will be
-              prompted to convert it using our conversion script from v2.1 to v3.0, which you can find at
-              lerobot/scripts/convert_dataset_v21_to_v30.py.
+        这个构造函数默认服务于“读取已有数据集”的场景。
+        如果你要新建数据集或者在已有数据集末尾继续录制，推荐使用
+        :meth:`create` 或 :meth:`resume`。
 
-
-        2. Your dataset doesn't already exists (either on local disk or on the Hub): you can create an empty
-           LeRobotDataset with the 'create' classmethod. This can be used for recording a dataset or port an
-           existing dataset to the LeRobotDataset format.
-
-
-        In terms of files, LeRobotDataset encapsulates 3 main things:
-            - metadata:
-                - info contains various information about the dataset like shapes, keys, fps etc.
-                - stats stores the dataset statistics of the different modalities for normalization
-                - tasks contains the prompts for each task of the dataset, which can be used for
-                  task-conditioned training.
-            - data (backed by datasets.Dataset), which reads values from parquet files.
-            - videos (optional) from which frames are loaded to be synchronous with data from parquet files.
-
-        A typical LeRobotDataset looks like this from its root path:
-        .
-        ├── data
-        │   ├── chunk-000
-        │   │   ├── file-000.parquet
-        │   │   ├── file-001.parquet
-        │   │   └── ...
-        │   ├── chunk-001
-        │   │   ├── file-000.parquet
-        │   │   ├── file-001.parquet
-        │   │   └── ...
-        │   └── ...
-        ├── meta
-        │   ├── episodes
-        │   │   ├── chunk-000
-        │   │   │   ├── file-000.parquet
-        │   │   │   ├── file-001.parquet
-        │   │   │   └── ...
-        │   │   ├── chunk-001
-        │   │   │   └── ...
-        │   │   └── ...
-        │   ├── info.json
-        │   ├── stats.json
-        │   └── tasks.parquet
-        └── videos
-            ├── observation.images.laptop
-            │   ├── chunk-000
-            │   │   ├── file-000.mp4
-            │   │   ├── file-001.mp4
-            │   │   └── ...
-            │   ├── chunk-001
-            │   │   └── ...
-            │   └── ...
-            ├── observation.images.phone
-            │   ├── chunk-000
-            │   │   ├── file-000.mp4
-            │   │   ├── file-001.mp4
-            │   │   └── ...
-            │   ├── chunk-001
-            │   │   └── ...
-            │   └── ...
-            └── ...
-
-        Note that this file-based structure is designed to be as versatile as possible. Multiple episodes are
-        consolidated into chunked files which improves storage efficiency and loading performance. The
-        structure of the dataset is entirely described in the info.json file, which can be easily downloaded
-        or viewed directly on the hub before downloading any actual data. The type of files used are very
-        simple and do not need complex tools to be read, it only uses .parquet, .json and .mp4 files (and .md
-        for the README).
+        这个类底层管理的主要文件类型有三种：
+        - ``meta/``：info、stats、tasks、episodes 等元信息
+        - ``data/``：parquet 表格，存状态、动作、时间戳、索引等结构化数据
+        - ``videos/``：视频文件，读取时按 timestamp 解码出对应帧
 
         Args:
-            repo_id (str): This is the repo id that will be used to fetch the dataset.
-            root (Path | None, optional): Local directory where the dataset will be read from or downloaded
-                into. If set, all dataset files are materialized directly under this path. If not set,
-                existing local datasets are still looked up under ``$HF_LEROBOT_HOME/{repo_id}``, but Hub
-                downloads use a revision-safe snapshot cache under
-                ``$HF_LEROBOT_HOME/hub``.
-            episodes (list[int] | None, optional): If specified, this will only load episodes specified by
-                their episode_index in this list. Defaults to None.
-            image_transforms (Callable | None, optional): You can pass standard v2 image transforms from
-                torchvision.transforms.v2 here which will be applied to visual modalities (whether they come
-                from videos or images). Defaults to None.
-            delta_timestamps (dict[list[float]] | None, optional): _description_. Defaults to None.
-            tolerance_s (float, optional): Tolerance in seconds used to ensure data timestamps are actually in
-                sync with the fps value. It is used at the init of the dataset to make sure that each
-                timestamps is separated to the next by 1/fps +/- tolerance_s. This also applies to frames
-                decoded from video files. It is also used to check that `delta_timestamps` (when provided) are
-                multiples of 1/fps. Defaults to 1e-4.
-            revision (str, optional): An optional Git revision id which can be a branch name, a tag, or a
-                commit hash. Defaults to current codebase version tag.
-            force_cache_sync (bool, optional): Flag to sync and refresh local files first. If True and files
-                are already present in the local cache, this will be faster. However, files loaded might not
-                be in sync with the version on the hub, especially if you specified 'revision'. Defaults to
-                False.
-            download_videos (bool, optional): Flag to download the videos. Note that when set to True but the
-                video files are already present on local disk, they won't be downloaded again. Defaults to
-                True.
-            video_backend (str | None, optional): Video backend to use for decoding videos. Defaults to torchcodec when available int the platform; otherwise, defaults to 'pyav'.
-                You can also use the 'pyav' decoder used by Torchvision, which used to be the default option, or 'video_reader' which is another decoder of Torchvision.
-            batch_encoding_size (int, optional): Number of episodes to accumulate before batch encoding videos.
-                Set to 1 for immediate encoding (default), or higher for batched encoding. Defaults to 1.
-            vcodec (str, optional): Video codec for encoding videos during recording. Options: 'h264', 'hevc',
-                'libsvtav1', 'auto', or hardware-specific codecs like 'h264_videotoolbox', 'h264_nvenc'.
-                Defaults to 'libsvtav1'. Use 'auto' to auto-detect the best available hardware encoder.
-            streaming_encoding (bool, optional): If True, encode video frames in real-time during capture
-                instead of writing PNG images first. This makes save_episode() near-instant. Defaults to False.
-            encoder_queue_maxsize (int, optional): Maximum number of frames to buffer per camera when using
-                streaming encoding. Defaults to 30 (~1s at 30fps).
-            encoder_threads (int | None, optional): Number of threads per encoder instance. None lets the
-                codec auto-detect (default). Lower values reduce CPU usage per encoder. Maps to 'lp' (via svtav1-params) for
-                libsvtav1 and 'threads' for h264/hevc.
+            repo_id: 数据集仓库 ID，例如 ``user/my_dataset``。
+            root: 本地路径。提供时优先从这里读取或下载到这里；不提供时使用默认缓存。
+            episodes: 若不为 None，只加载指定的 episode 子集。
+            image_transforms: 可选图像变换，应用在视觉模态上。
+            delta_timestamps: 可选时序窗口配置，告诉 reader 读取当前样本前后哪些时间偏移。
+            tolerance_s: 时间同步容忍度，用于校验 timestamp/fps，也用于视频解码时容忍误差。
+            revision: Hub 版本号，可以是 branch/tag/commit。
+            force_cache_sync: 为 True 时，即便本地有缓存也优先同步。
+            download_videos: 下载数据集时是否把视频一并下载。
+            video_backend: 视频解码后端。
+            batch_encoding_size: 写模式下的旧参数，仅为了兼容老调用方式。
+            vcodec: 写模式下的视频编码器配置，仅为了兼容老调用方式。
+            streaming_encoding: 写模式下是否启用实时编码，仅为了兼容老调用方式。
+            encoder_queue_maxsize: streaming 编码时每个相机的队列上限。
+            encoder_threads: 视频编码线程数。
 
         Note:
-            Write-mode parameters (``streaming_encoding``, ``batch_encoding_size``) passed to
-            ``__init__`` are deprecated. Use :meth:`create` for new datasets or :meth:`resume`
-            to append to existing ones.
+            把写模式参数直接传给 ``__init__`` 已经过时。
+            新建数据集请用 :meth:`create`，继续录制请用 :meth:`resume`。
         """
         super().__init__()
         self.repo_id = repo_id
@@ -205,14 +128,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self._requested_root is not None:
             self._requested_root.mkdir(exist_ok=True, parents=True)
 
-        # Load metadata (sets self.root once from the resolved metadata root)
+        # 先加载 metadata。metadata 会决定真正的数据集根目录、特征、统计量、episode 索引等。
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self._requested_root, self.revision, force_cache_sync=force_cache_sync
         )
         self.root = self.meta.root
         self.revision = self.meta.revision
 
-        # Create reader (hf_dataset loaded below)
+        # 先构造 reader，但 HF dataset 本体是否立刻激活，取决于本地缓存是否完整。
         self.reader = DatasetReader(
             meta=self.meta,
             root=self.root,
@@ -223,14 +146,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
             image_transforms=image_transforms,
         )
 
-        # Load actual data
+        # 优先尝试使用本地已有数据；如果本地不完整，再触发下载。
         if force_cache_sync or not self.reader.try_load():
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
             self._download(download_videos)
             self.reader.load_and_activate()
 
-        # Detect write-mode params for backward compatibility
+        # 这段是兼容旧接口的“半写模式”路径。
+        # 新代码不建议再依赖这里，应该显式调用 create()/resume()。
         _has_write_params = streaming_encoding or batch_encoding_size != 1
         if _has_write_params:
             import warnings
@@ -258,11 +182,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
         else:
             self.writer = None
 
+        # 写模式只有 finalize() 之后才允许安全读取。
         self._is_finalized = False
 
     # ── Writer guard ──────────────────────────────────────────────────
 
     def _require_writer(self, method_name: str) -> None:
+        """确保当前 dataset 处于可写状态。"""
         if self.writer is None:
             raise RuntimeError(
                 f"Cannot call '{method_name}()' on a read-only dataset. "
@@ -273,7 +199,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
     # ── Reader guard ──────────────────────────────────────────────────
 
     def _ensure_reader(self) -> DatasetReader:
-        """Lazily create the reader on first access."""
+        """
+        按需构造 reader。
+
+        create()/resume() 生成的对象一开始通常只负责写，不需要 reader。
+        只有真正进入读取路径时，才在这里延迟初始化。
+        """
         if self.reader is None:
             self.reader = DatasetReader(
                 meta=self.meta,
@@ -293,6 +224,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_queue_maxsize: int,
         encoder_threads: int | None,
     ) -> StreamingVideoEncoder:
+        """构造实时视频编码器。"""
         return StreamingVideoEncoder(
             fps=fps,
             vcodec=vcodec,
@@ -308,35 +240,43 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     @property
     def fps(self) -> int:
-        """Frames per second used during data collection."""
+        """数据采集时使用的 fps。"""
         return self.meta.fps
 
     @property
     def num_frames(self) -> int:
-        """Number of frames in selected episodes."""
-        # Check directly instead of using _ensure_reader(): in write-only mode
-        # (create/resume) we rely on metadata rather than initializing a reader.
+        """
+        当前选中 episode 子集中的总帧数。
+
+        在写模式下，这里不强行初始化 reader，而是直接依赖 metadata 里的累计值。
+        """
         if self.reader is None:
             return self.meta.total_frames
         return self.reader.num_frames
 
     @property
     def num_episodes(self) -> int:
-        """Number of episodes selected."""
-        # Check directly instead of using _ensure_reader(): in write-only mode
-        # (create/resume) we rely on metadata rather than initializing a reader.
+        """
+        当前选中的 episode 数量。
+
+        这里同样兼容“只写不读”的 dataset 状态。
+        """
         if self.reader is None:
             return self.meta.total_episodes
         return self.reader.num_episodes
 
     @property
     def features(self) -> dict[str, dict]:
-        """Feature specification dict mapping feature names to their type/shape metadata."""
+        """返回 feature 定义表，描述每个字段的类型、shape、语义。"""
         return self.meta.features
 
     @property
     def hf_dataset(self) -> datasets.Dataset:
-        """The underlying Hugging Face Dataset object"""
+        """
+        返回底层 Hugging Face Dataset 对象。
+
+        这是 parquet 数据表的直接入口。若 reader 尚未激活，这里会触发一次加载。
+        """
         self.reader = self._ensure_reader()
         if self.reader.hf_dataset is None:
             self.reader.load_and_activate()
@@ -345,69 +285,72 @@ class LeRobotDataset(torch.utils.data.Dataset):
     # ── Writer-delegated methods ──────────────────────────────────────
 
     def add_frame(self, frame: dict) -> None:
-        """Add a single frame to the current episode buffer.
+        """
+        向当前 episode 缓冲区追加一帧。
 
-        Delegates to :meth:`DatasetWriter.add_frame`. The dataset must be in
-        write mode (created via :meth:`create` or :meth:`resume`).
+        这是录制路径最细粒度的写接口。真正的落盘不会在这里完成，
+        而是先进入 writer 的 episode_buffer，等到 save_episode() 再统一写 parquet 和视频。
 
         Args:
-            frame: Dict mapping feature names to their values for this frame.
-                Must include a ``'task'`` key. Torch tensors are converted to numpy.
+            frame: 一帧数据，必须包含 feature 对应字段以及 ``task``。
 
         Raises:
-            RuntimeError: If the dataset is read-only (no writer).
+            RuntimeError: 当前是只读 dataset 时抛出。
         """
         self._require_writer("add_frame")
         self.writer.add_frame(frame)
 
     def save_episode(self, episode_data: dict | None = None, parallel_encoding: bool = True) -> None:
-        """Save the current episode buffer to disk.
+        """
+        把当前 episode 缓冲区正式保存到磁盘。
 
-        Delegates to :meth:`DatasetWriter.save_episode`. Encodes videos, writes
-        parquet data, and updates metadata. The episode buffer is reset afterward.
+        这个调用会触发写主数据表、编码视频、更新 episode metadata 和 stats。
+        如果没有显式传入 ``episode_data``，就默认使用 add_frame() 一路积累的内部缓冲区。
 
         Args:
-            episode_data: Optional pre-built episode dict. If ``None``, uses the
-                internal episode buffer populated by :meth:`add_frame`.
-            parallel_encoding: If ``True`` and multiple cameras exist, encode
-                videos in parallel using a process pool.
+            episode_data: 可选，手工构造好的 episode 字典。
+            parallel_encoding: 多相机时是否并行编码视频。
 
         Raises:
-            RuntimeError: If the dataset is read-only (no writer).
+            RuntimeError: 当前是只读 dataset 时抛出。
         """
         self._require_writer("save_episode")
         self.writer.save_episode(episode_data, parallel_encoding)
 
     def clear_episode_buffer(self, delete_images: bool = True) -> None:
-        """Discard the current episode buffer without saving.
+        """
+        丢弃当前还没保存的 episode 缓冲区。
 
-        Delegates to :meth:`DatasetWriter.clear_episode_buffer`. Useful for
-        discarding a failed or interrupted recording episode.
+        常见于录制失败、人工重录、或者中途终止时，放弃当前 episode 而不落盘。
 
         Args:
-            delete_images: If ``True``, also remove temporary image files written
-                to disk for the current episode.
+            delete_images: 是否连同当前 episode 的临时图像文件一起删掉。
 
         Raises:
-            RuntimeError: If the dataset is read-only (no writer).
+            RuntimeError: 当前是只读 dataset 时抛出。
         """
         self._require_writer("clear_episode_buffer")
         self.writer.clear_episode_buffer(delete_images)
 
     def has_pending_frames(self) -> bool:
-        """Check if there are unsaved frames in the episode buffer."""
+        """判断当前是否还有尚未保存的帧。"""
         if self.writer is None:
             return False
         return self.writer.episode_buffer is not None and self.writer.episode_buffer["size"] > 0
 
     def finalize(self):
-        """Flush all pending work and close writers.
+        """
+        完成写模式数据集的最终收尾。
 
-        Must be called after data collection/conversion, otherwise footer metadata
-        won't be written to the parquet files and the dataset will be invalid.
+        finalize() 的职责是：
+        - 把 writer 里尚未刷盘的内容全部落盘
+        - 关闭 parquet writer / 编码器等资源
+        - 把 dataset 标记为“可以安全读取”
 
-        Idempotent — safe to call multiple times.  DatasetWriter.__del__ acts as a
-        safety net if this is never called explicitly.
+        如果录制完不调用 finalize()，数据文件尾部元信息可能不完整，
+        后续读取就可能失败或得到无效数据。
+
+        这个方法是幂等的，多次调用不会重复破坏状态。
         """
         if self._is_finalized:
             return
@@ -418,25 +361,31 @@ class LeRobotDataset(torch.utils.data.Dataset):
     # ── Core Dataset methods ──────────────────────────────────────────
 
     def __len__(self):
-        """Return the number of frames in the selected episodes."""
+        """返回当前 dataset 可见的样本数。"""
         return self.num_frames
 
     def __getitem__(self, idx) -> dict:
-        """Return a single frame by index, with all transforms applied.
+        """
+        按索引返回一条训练/评估样本。
 
-        Loads the frame from the underlying HF dataset, expands delta-timestamp
-        windows, decodes video frames, and applies image transforms. Delegates
-        the core logic to :meth:`DatasetReader.get_item`.
+        这是 PyTorch DataLoader 真正会调用的接口。
+        复杂逻辑都不在这里手写，而是交给 DatasetReader.get_item()：
+        - 从 parquet 读取基础字段
+        - 根据 delta_timestamps 展开时间窗口
+        - 解码对应视频帧
+        - 应用图像变换
+
+        注意：如果当前 dataset 仍处于录制中且还没 finalize()，
+        这里会拒绝读取，避免训练侧看到半成品数据。
 
         Args:
-            idx: Index into the (possibly episode-filtered) dataset.
+            idx: dataset 内部索引。若指定了 episodes 子集，它是过滤后的相对索引。
 
         Returns:
-            Dict mapping feature names to their tensor values for this frame.
+            一个字典，key 是 feature 名，value 是该样本对应的张量/值。
 
         Raises:
-            RuntimeError: If the dataset is currently being recorded and
-                :meth:`finalize` has not been called yet.
+            RuntimeError: 写模式尚未 finalize 时抛出。
         """
         if self.writer is not None and not self._is_finalized:
             raise RuntimeError(
@@ -444,23 +393,28 @@ class LeRobotDataset(torch.utils.data.Dataset):
             )
         reader = self._ensure_reader()
         if reader.hf_dataset is None:
-            # One-shot load after finalize()
+            # 这是写模式 finalize 之后第一次读取时的“一次性激活”路径。
             reader.load_and_activate()
         return reader.get_item(idx)
 
     def select_columns(self, column_names: str | list[str]):
-        """Select specific columns from the underlying dataset.
+        """
+        只选择底层 HF dataset 的部分列。
 
-        Useful for extracting action sequences during replay without loading all features.
-        Returns a ``datasets.Dataset`` containing only the requested columns.
+        适合做轻量分析，例如只取动作列，而不触发完整样本读取流程。
         """
         return self.hf_dataset.select_columns(column_names)
 
     def get_raw_item(self, idx) -> dict:
-        """Get a raw frame without image transforms applied.
+        """
+        直接返回原始表格行，不做高级读取逻辑。
 
-        Unlike ``__getitem__``, this returns the raw HF dataset row at the given
-        index with no delta-timestamp expansion, video decoding, or image transforms.
+        和 ``__getitem__`` 不同，这里不会：
+        - 展开 delta_timestamps
+        - 解码视频帧
+        - 应用图像变换
+
+        这个接口更适合调试 dataset 底层存储内容。
         """
         return self.hf_dataset[idx]
 
@@ -489,27 +443,27 @@ class LeRobotDataset(torch.utils.data.Dataset):
         upload_large_folder: bool = False,
         **card_kwargs,
     ) -> None:
-        """Upload the dataset to the Hugging Face Hub.
+        """
+        把当前数据集上传到 Hugging Face Hub。
 
-        Creates the repository if it does not exist, uploads all dataset files
-        (optionally excluding videos), generates a dataset card, and tags the
-        revision with the current codebase version.
+        这个接口会负责：
+        - 必要时创建 dataset repo
+        - 上传本地文件夹
+        - 生成并推送 dataset card
+        - 按当前代码库版本打 tag
 
         Args:
-            branch: Optional branch to push to. Created from the current
-                revision if it does not exist.
-            tags: Optional list of tags for the dataset card.
-            license: License identifier for the dataset card.
-            tag_version: If ``True``, create a Git tag for the current codebase
-                version.
-            push_videos: If ``False``, skip uploading the ``videos/`` directory.
-            private: If ``True``, create a private repository.
-            allow_patterns: Glob pattern(s) restricting which files to upload.
-            upload_large_folder: If ``True``, use ``upload_large_folder`` instead
-                of ``upload_folder`` for very large datasets.
-            **card_kwargs: Additional keyword arguments forwarded to dataset card
-                creation.
+            branch: 可选目标分支；不存在时会先创建。
+            tags: dataset card 上附加的标签。
+            license: dataset card 使用的许可证标识。
+            tag_version: 是否为当前代码版本创建 Git tag。
+            push_videos: 为 False 时跳过 ``videos/`` 目录。
+            private: 是否创建私有 dataset repo。
+            allow_patterns: 限制上传文件的 glob 规则。
+            upload_large_folder: 超大数据集时改用 ``upload_large_folder``。
+            **card_kwargs: 透传给 dataset card 生成逻辑的其他参数。
         """
+        # images/ 往往只是中间产物，不需要上传；videos/ 是否上传由参数控制。
         ignore_patterns = ["images/"]
         if not push_videos:
             ignore_patterns.append("videos/")
@@ -554,14 +508,20 @@ class LeRobotDataset(torch.utils.data.Dataset):
             hub_api.create_tag(self.repo_id, tag=CODEBASE_VERSION, revision=branch, repo_type="dataset")
 
     def _download(self, download_videos: bool = True) -> None:
-        """Downloads the dataset from the given 'repo_id' at the provided version."""
+        """
+        从 Hub 下载数据集到本地。
+
+        如果当前对象只请求了部分 episode，这里会尽量只下载这些 episode 对应的数据和视频文件，
+        避免把整套大数据全部拉到本地。
+        """
         ignore_patterns = None if download_videos else "videos/"
         files = None
         if self.episodes is not None:
-            # Reader is guaranteed to exist here (created in __init__ before _download)
+            # reader 在 __init__ 里已经创建好，这里复用它来计算“只下载哪些文件”。
             files = self.reader.get_episodes_file_paths()
 
         if self._requested_root is None:
+            # 没指定 root 时，下载到 revision-safe 的共享 snapshot cache。
             self.meta.root = Path(
                 snapshot_download(
                     self.repo_id,
@@ -573,6 +533,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 )
             )
         else:
+            # 指定了 root 时，直接把数据实体化到用户提供的目录。
             self._requested_root.mkdir(exist_ok=True, parents=True)
             snapshot_download(
                 self.repo_id,
@@ -584,7 +545,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             )
             self.meta.root = self._requested_root
 
-        # Propagate resolved root from metadata (single source of truth)
+        # metadata.root 是最终单一可信来源，dataset 和 reader 都同步到这里。
         self.root = self.meta.root
         self.reader.root = self.meta.root
 
@@ -610,44 +571,44 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
     ) -> "LeRobotDataset":
-        """Create a new LeRobotDataset from scratch for recording data.
+        """
+        从零创建一个全新的可写数据集。
 
-        Returns a write-mode dataset with an active :class:`DatasetWriter`. Use
-        :meth:`add_frame` / :meth:`save_episode` to populate it, then
-        :meth:`finalize` when done.
+        这是录制数据时的正式入口。它不会走 ``__init__`` 的读取路径，
+        而是直接：
+        1. 创建 metadata 骨架和 ``meta/info.json``
+        2. 初始化 writer
+        3. 返回一个“只写模式”的 LeRobotDataset
+
+        标准使用顺序通常是：
+        - ``add_frame()`` 累积一帧帧数据
+        - ``save_episode()`` 保存一个 episode
+        - ``finalize()`` 完成收尾
 
         Args:
-            repo_id: Repository identifier, typically ``'{hf_user}/{dataset_name}'``.
-            fps: Frames per second used during data collection.
-            features: Feature specification dict mapping feature names to their
-                type/shape metadata.
-            root: Local directory for dataset storage. Defaults to
-                ``$HF_LEROBOT_HOME/{repo_id}``.
-            robot_type: Optional robot type string stored in metadata.
-            use_videos: If ``True``, visual modalities are stored as MP4 videos.
-                If ``False``, they are stored as images.
-            tolerance_s: Timestamp synchronization tolerance in seconds.
-            image_writer_processes: Number of subprocesses for async image
-                writing. ``0`` means use threads only.
-            image_writer_threads: Number of threads for async image writing.
-            video_backend: Video decoding backend (used when reading back).
-            batch_encoding_size: Number of episodes to accumulate before
-                batch-encoding videos. ``1`` means encode immediately.
-            vcodec: Video codec for encoding. Options include ``'libsvtav1'``,
-                ``'h264'``, ``'hevc'``, ``'auto'``.
-            metadata_buffer_size: Number of episode metadata records to buffer
-                before flushing to parquet.
-            streaming_encoding: If ``True``, encode video frames in real-time
-                during capture instead of writing images first.
-            encoder_queue_maxsize: Max buffered frames per camera when using
-                streaming encoding.
-            encoder_threads: Threads per encoder instance. ``None`` for auto.
+            repo_id: 数据集仓库 ID。
+            fps: 采集频率。
+            features: feature 定义表。
+            root: 本地保存路径。
+            robot_type: 可选，写入 metadata 的机器人类型。
+            use_videos: 是否把视觉模态保存为视频。
+            tolerance_s: 时间同步容忍度。
+            image_writer_processes: 异步写图像的子进程数。
+            image_writer_threads: 异步写图像的线程数。
+            video_backend: 以后读视频时默认使用的后端。
+            batch_encoding_size: 多少个 episode 聚合后再批量编码视频。
+            vcodec: 视频编码器。
+            metadata_buffer_size: metadata parquet 的缓冲区大小。
+            streaming_encoding: 是否边采边编码视频。
+            encoder_queue_maxsize: streaming 编码时每相机队列大小。
+            encoder_threads: 编码线程数。
 
         Returns:
-            A new :class:`LeRobotDataset` in write mode.
+            一个处于写模式的 LeRobotDataset。
         """
         vcodec = resolve_vcodec(vcodec)
         obj = cls.__new__(cls)
+        # create() 直接走 metadata.create()，不会触发“读取现有数据集”的初始化逻辑。
         obj.meta = LeRobotDatasetMetadata.create(
             repo_id=repo_id,
             fps=fps,
@@ -670,10 +631,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj._vcodec = vcodec
         obj._encoder_threads = encoder_threads
 
-        # Reader is lazily created on first access (write-only mode)
+        # 新建数据集时一开始只负责写，不需要 reader。
         obj.reader = None
 
-        # Create writer
+        # 真正把“可写能力”接上的是 DatasetWriter。
         streaming_enc = None
         if streaming_encoding and len(obj.meta.video_keys) > 0:
             streaming_enc = cls._build_streaming_encoder(fps, vcodec, encoder_queue_maxsize, encoder_threads)
@@ -686,6 +647,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             streaming_encoder=streaming_enc,
         )
 
+        # 如果配置了异步图片写入，这里直接启动后台 writer。
         if image_writer_processes or image_writer_threads:
             obj.writer.start_image_writer(image_writer_processes, image_writer_threads)
 
@@ -710,37 +672,30 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
     ) -> "LeRobotDataset":
-        """Resume recording on an existing dataset.
+        """
+        在一个已有数据集后面继续追加录制。
 
-        Loads metadata from an existing dataset (local or Hub) and creates a
-        :class:`DatasetWriter` for appending new episodes. The underlying HF
-        dataset is not loaded until :meth:`finalize` is called and data is
-        subsequently read.
+        这个入口适用于“数据集已经存在，本次只是在末尾接着加 episode”。
+        它会读取已有 metadata，保留之前的 total_frames / total_episodes，
+        然后创建一个新的 DatasetWriter，从现有末尾继续写。
 
         Args:
-            repo_id: Repository identifier of the existing dataset.
-            root: Local directory of the dataset. When provided, Hub downloads
-                are materialized directly into this directory. When omitted,
-                Hub downloads use a revision-safe snapshot cache under
-                ``$HF_LEROBOT_HOME/hub``.
-            tolerance_s: Timestamp synchronization tolerance in seconds.
-            revision: Git revision (branch, tag, or commit hash). Defaults to
-                current codebase version tag.
-            force_cache_sync: If ``True``, re-download metadata from the Hub even
-                if a local cache exists.
-            video_backend: Video decoding backend for reading back data.
-            batch_encoding_size: Number of episodes to accumulate before
-                batch-encoding videos.
-            vcodec: Video codec for encoding.
-            image_writer_processes: Subprocesses for async image writing.
-            image_writer_threads: Threads for async image writing.
-            streaming_encoding: If ``True``, encode video in real-time during
-                capture.
-            encoder_queue_maxsize: Max buffered frames per camera for streaming.
-            encoder_threads: Threads per encoder instance. ``None`` for auto.
+            repo_id: 已存在的数据集仓库 ID。
+            root: 本地数据集目录。这里必须显式提供。
+            tolerance_s: 时间同步容忍度。
+            revision: 版本号。
+            force_cache_sync: 是否强制先和 Hub 同步 metadata。
+            video_backend: 视频解码后端。
+            batch_encoding_size: 视频批量编码粒度。
+            vcodec: 视频编码器。
+            image_writer_processes: 异步写图像的子进程数。
+            image_writer_threads: 异步写图像的线程数。
+            streaming_encoding: 是否启用实时视频编码。
+            encoder_queue_maxsize: streaming 编码队列大小。
+            encoder_threads: 编码线程数。
 
         Returns:
-            A :class:`LeRobotDataset` in write mode, ready to append episodes.
+            一个处于写模式、并且会在原数据集末尾继续写入的 LeRobotDataset。
         """
         if not root:
             raise ValueError(
@@ -765,16 +720,17 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if obj._requested_root is not None:
             obj._requested_root.mkdir(exist_ok=True, parents=True)
 
-        # Load metadata (revision-safe when root is not provided)
+        # resume 的关键不是读完整数据，而是把已有 metadata 状态先接回来，
+        # 这样 writer 才知道从第几个 episode、哪个全局 frame 开始续写。
         obj.meta = LeRobotDatasetMetadata(
             obj.repo_id, obj._requested_root, obj.revision, force_cache_sync=force_cache_sync
         )
         obj.root = obj.meta.root
 
-        # Reader is lazily created on first access (write-only mode)
+        # 继续录制时默认也不需要 reader，仍然采用按需初始化策略。
         obj.reader = None
 
-        # Create writer for appending
+        # initial_frames 很关键：它保证续写数据时 index / 时间范围能接上原数据集。
         streaming_enc = None
         if streaming_encoding and len(obj.meta.video_keys) > 0:
             streaming_enc = cls._build_streaming_encoder(

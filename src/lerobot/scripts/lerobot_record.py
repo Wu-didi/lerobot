@@ -152,6 +152,12 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 from lerobot.robots import bi_koch_follower
 from lerobot.teleoperators import bi_koch_leader
 
+
+# 这两个 dataclass 是 `lerobot-record` 的配置入口：
+# 1. `DatasetRecordConfig` 只负责“数据怎么存”
+# 2. `RecordConfig` 负责“整个录制流程怎么跑”
+# 这样拆开后，dataset 相关参数可以独立理解，不会和 robot / teleop / policy
+# 的运行时参数混在一起。
 @dataclass
 class DatasetRecordConfig:
     # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
@@ -205,12 +211,22 @@ class DatasetRecordConfig:
     rename_map: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
+        """校验 dataset 级别的必要字段。
+
+        作用：
+        - 在真正连接机器人、创建数据集之前，尽早拦住无效配置。
+        - 这里目前只强制 `single_task` 必填，因为后续每一帧都会把 task 文本
+          写入 dataset，policy 条件输入也会依赖它。
+        """
         if self.single_task is None:
             raise ValueError("You need to provide a task as argument in `single_task`.")
 
 
 @dataclass
 class RecordConfig:
+    # `robot` 和 `dataset` 是录制一定需要的两部分。
+    # `teleop` 和 `policy` 不要求同时存在，但至少要有一个控制源，否则 robot
+    # 只能读 observation，无法产生 action。
     robot: RobotConfig
     dataset: DatasetRecordConfig
     # Whether to control the robot with a teleoperator
@@ -231,21 +247,39 @@ class RecordConfig:
     resume: bool = False
 
     def __post_init__(self):
-        # HACK: We parse again the cli args here to get the pretrained path if there was one.
+        """补全 policy 配置，并校验控制源是否合法。
+
+        作用：
+        - 从 CLI 中重新解析 `--policy.path`，把它变成 `PreTrainedConfig`。
+        - 这是 train / eval / record 共用的一种模式：dataclass 里存的是结构化配置，
+          但预训练权重路径更适合在这里统一补齐。
+        - 同时保证控制源不是空的：至少要么 teleop，要么 policy。
+        """
+        # 这里再次从 CLI 取 path，是因为 `policy.path` 这种“路径型字段”在真正
+        # 加载预训练配置时，还需要合并用户通过 CLI 传入的 policy override。
         policy_path = parser.get_path_arg("policy")
 
         if policy_path:
+            # 例如用户除了 `--policy.path=...`，还可能额外传
+            # `--policy.device=cuda` 这种 override；这里一起吃进去。
             cli_overrides = parser.get_cli_overrides("policy")
 
             self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
             self.policy.pretrained_path = policy_path
 
+        # 整个 `record_loop` 依赖 action 来源。没有 teleop 也没有 policy 时，
+        # 录制流程虽然能采 observation，但无法控制机器人，因此直接报错。
         if self.teleop is None and self.policy is None:
             raise ValueError("Choose a policy, a teleoperator or both to control the robot")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
-        """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
+        """告诉 parser：`policy` 下面有 path-like 字段需要特殊处理。
+
+        作用：
+        - 允许命令行使用 `--policy.path=local/dir`。
+        - 这会让 parser 知道后续需要从该目录读取模型配置。
+        """
         return ["policy"]
 
 
@@ -303,11 +337,35 @@ def record_loop(
     display_data: bool = False,
     display_compressed_images: bool = False,
 ):
+    """执行一段连续的控制循环。
+
+    这是 `record` 子系统里最核心的函数。可以把它理解成：
+    “以固定 fps 重复执行 observation -> action -> robot -> dataset 的闭环”。
+
+    这个函数会被上层 `record()` 复用两次：
+    1. 正式录制 episode 时：
+       - `dataset` 不为 None
+       - 每个 tick 都会写一帧到数据集缓冲区
+    2. episode 之间 reset 时：
+       - `dataset` 仍然传入，但上层也可能用“无录制控制窗口”的方式复用同样逻辑
+       - 目的是给人时间把场景和机器人恢复到下一条轨迹的起点
+
+    参数作用概览：
+    - `robot`：真实硬件接口，负责读 observation 和发 action
+    - `teleop_action_processor`：把 teleop 原始动作变成统一动作表示
+    - `robot_action_processor`：把统一动作表示变成机器人真正接受的动作
+    - `robot_observation_processor`：把原始 observation 变成统一特征格式
+    - `policy/preprocessor/postprocessor`：policy 控制路径的三件套
+    - `events`：键盘事件状态，允许中断 / 重录 / 停止
+    """
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
     teleop_arm = teleop_keyboard = None
     if isinstance(teleop, list):
+        # 多 teleop 目前是 LeKiwi 的专用分支：
+        # 一个机械臂 teleop 负责 arm，键盘 teleop 负责 base。
+        # 所以这里要先把两种控制器从 list 中拆出来。
         teleop_keyboard = next((t for t in teleop if isinstance(t, KeyboardTeleop)), None)
         teleop_arm = next(
             (
@@ -331,7 +389,8 @@ def record_loop(
                 "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
             )
 
-    # Reset policy and processor if they are provided
+    # 每个 episode / reset 窗口开始前都把 policy 和 processor 状态清空。
+    # 这样可以避免上一个 episode 的历史缓存影响当前 episode。
     if policy is not None and preprocessor is not None and postprocessor is not None:
         policy.reset()
         preprocessor.reset()
@@ -343,21 +402,47 @@ def record_loop(
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
+        # `events` 来自键盘监听线程：
+        # - 右键：提前结束当前窗口
+        # - 左键：提前结束并标记重录
+        # - ESC：停止整个录制流程
+        # 这里的职责只是“感知并退出本轮循环”，真正怎么处理这些事件由上层 `record()`
+        # 决定。
         if events["exit_early"]:
             events["exit_early"] = False
             break
 
-        # Get robot observation
+        # Step 1. 从真实机器人读取当前 observation。
+        # 这是整个闭环的起点：policy 和 dataset 都依赖这份观测。
         obs = robot.get_observation()
 
-        # Applies a pipeline to the raw robot observation, default is IdentityProcessor
+        # Step 2. 对 observation 做统一处理。
+        # 这个 processor 会把“硬件原始输出”整理成 LeRobot 统一约定的 observation
+        # 格式，例如 state / image 的键名、shape、类型等。
         obs_processed = robot_observation_processor(obs)
 
         if policy is not None or dataset is not None:
+            # `build_dataset_frame` 的作用是把处理后的 observation 映射成 dataset
+            # 的平铺特征字典。
+            # 这里非常关键：policy 控制路径复用了 dataset 的特征表示，这样
+            # “模型实际看到的输入”和“磁盘里存下来的 observation”天然对齐。
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
-        # Get action from either policy or teleop
+        # Step 3. 选择 action 来源。
+        # 这个函数支持三种控制模式：
+        # 1. policy 控制
+        # 2. 单一 teleop 控制
+        # 3. LeKiwi 的多 teleop 控制
         if policy is not None and preprocessor is not None and postprocessor is not None:
+            # policy 分支走的是“同步推理”：
+            # observation_frame
+            #   -> preprocessor
+            #   -> policy.select_action()
+            #   -> postprocessor
+            #   -> action tensor
+            #
+            # `predict_action` 封装了这整条链，所以 record_loop 本身不直接关心
+            # 张量搬运、amp、图像 CHW 转换等细节。
             action_values = predict_action(
                 observation=observation_frame,
                 policy=policy,
@@ -369,17 +454,27 @@ def record_loop(
                 robot_type=robot.robot_type,
             )
 
+            # policy 输出通常是 tensor / ndarray 风格的向量。
+            # `make_robot_action` 会用 dataset schema 中的 action feature 名称，
+            # 把它还原成“关节名 -> 数值”的 RobotAction 字典。
             act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
 
         elif policy is None and isinstance(teleop, Teleoperator):
+            # 单一 teleop 分支：直接从 teleoperator 读取动作。
+            # 对 unitree_g1 这种机器人，teleop 之前还会接收反馈。
             if robot.name == "unitree_g1":
                 teleop.send_feedback(obs)
             act = teleop.get_action()
 
-            # Applies a pipeline to the raw teleop action, default is IdentityProcessor
+            # teleop 原始动作也要经过 processor，目的是和 policy 分支统一到
+            # 同一套动作表示，后面 robot_action_processor 才能共用。
             act_processed_teleop = teleop_action_processor((act, obs))
 
         elif policy is None and isinstance(teleop, list):
+            # LeKiwi 多 teleop 分支：
+            # - arm_action 来自机械臂 teleop
+            # - keyboard_action 来自键盘
+            # - 最后把它们合并成一个完整的机器人动作
             arm_action = teleop_arm.get_action()
             arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
             keyboard_action = teleop_keyboard.get_action()
@@ -396,7 +491,9 @@ def record_loop(
                 )
             continue
 
-        # Applies a pipeline to the action, default is IdentityProcessor
+        # Step 4. 无论 action 来自 policy 还是 teleop，都会在这里汇合。
+        # `robot_action_processor` 的职责是把统一动作表示转换成“真正发给机器人”
+        # 的动作格式，例如做键名重排、裁剪、硬件接口适配等。
         if policy is not None and act_processed_policy is not None:
             action_values = act_processed_policy
             robot_action_to_send = robot_action_processor((act_processed_policy, obs))
@@ -410,17 +507,22 @@ def record_loop(
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
 
-        # Write to dataset
+        # Step 5. 把这一帧写进 dataset buffer。
+        # 注意这里写入的是“本轮控制选择出来的 action_values”，然后和当前 observation
+        # 一起组成一帧，真正落盘发生在上层 `dataset.save_episode()`。
         if dataset is not None:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
 
+        # 可选的可视化分支：把当前观测和动作发送到 Rerun。
         if display_data:
             log_rerun_data(
                 observation=obs_processed, action=action_values, compress_images=display_compressed_images
             )
 
+        # Step 6. 维持近似恒定的控制频率。
+        # 每个 tick 的计算耗时不同，所以这里用“目标周期 - 当前耗时”的方式补 sleep。
         dt_s = time.perf_counter() - start_loop_t
 
         sleep_time_s: float = 1 / fps - dt_s
@@ -436,6 +538,24 @@ def record_loop(
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
+    """`lerobot-record` 的顶层入口。
+
+    作用：
+    1. 初始化日志和可视化
+    2. 构造 robot / teleop / processors
+    3. 创建或恢复 dataset
+    4. 按需加载 policy 与 pre/post processors
+    5. 连接硬件、启动键盘监听
+    6. 按 episode 反复调用 `record_loop`
+    7. 统一执行保存、上传、断连、清理
+
+    可以把这个函数理解成“episode 级调度器”，而不是单步控制器。
+    真正每个 tick 做什么，是 `record_loop()` 的职责；
+    `record()` 更像是在组织：
+    - 什么时候开始一条 episode
+    - 什么时候进入 reset
+    - 什么时候保存或丢弃当前 episode
+    """
     init_logging()
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
@@ -446,11 +566,23 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         else cfg.display_compressed_images
     )
 
+    # 先根据配置构造硬件对象，但此时还没有真正 connect。
+    # 这样如果后面 dataset / policy 初始化失败，不会留下半连接状态的设备。
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
+    # 三类默认 processor 分别负责：
+    # - teleop_action_processor：teleop 原始动作 -> 统一动作表示
+    # - robot_action_processor：统一动作表示 -> 真正发送给 robot 的动作
+    # - robot_observation_processor：robot 原始 observation -> 统一 observation 表示
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
+    # dataset schema 不是手写的，而是从 processors + robot feature 定义里推导出来的。
+    # 这样可以保证：
+    # - 你记录下来的字段
+    # - policy 实际吃到的字段
+    # - processor 实际生成的字段
+    # 三者保持一致。
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(
             pipeline=teleop_action_processor,
@@ -471,6 +603,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     try:
         if cfg.resume:
+            # resume 分支：复用已有 dataset 的 metadata，并重新挂上图像写线程 / 视频编码器。
+            # 这是“继续往旧数据集后面追加 episode”，不是重新创建数据集。
             num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
             dataset = LeRobotDataset.resume(
                 cfg.dataset.repo_id,
@@ -485,9 +619,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 if num_cameras > 0
                 else 0,
             )
+            # 恢复老数据集时，必须确认“当前 robot + 当前 processors 推导出的 schema”
+            # 和历史 dataset 真的是兼容的，否则继续写会把数据集弄坏。
             sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
         else:
-            # Create empty dataset or load existing saved episodes
+            # create 分支：新建一个空数据集，然后后面逐 episode 往里追加。
             sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
             dataset = LeRobotDataset.create(
                 cfg.dataset.repo_id,
@@ -505,11 +641,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 encoder_threads=cfg.dataset.encoder_threads,
             )
 
-        # Load pretrained policy
+        # policy 是可选的：如果用户是纯 teleop 录数据，这里会保持 None。
+        # 如果有 policy，则从 checkpoint / hub 加载成可直接 rollout 的对象。
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
         preprocessor = None
         postprocessor = None
         if cfg.policy is not None:
+            # 这里加载 policy 配套的处理链：
+            # - preprocessor：把 observation 变成模型输入
+            # - postprocessor：把模型输出变成统一动作表示
+            #
+            # `rename_map` 的作用是把“当前 robot / dataset 的观测键名”映射成
+            # “policy 训练时期待的键名”。
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=cfg.policy,
                 pretrained_path=cfg.policy.pretrained_path,
@@ -520,10 +663,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 },
             )
 
+        # 到这里，配置、dataset、policy 都准备好了，才真正连接硬件。
         robot.connect()
         if teleop is not None:
             teleop.connect()
 
+        # 键盘监听返回一个共享字典 `events`，record_loop 和 record() 都会读它。
         listener, events = init_keyboard_listener()
 
         if not cfg.dataset.streaming_encoding:
@@ -531,9 +676,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
             )
 
+        # VideoEncodingManager 统一托管视频编码相关资源。
+        # 这样即使中途异常退出，也能尽量走到一致的收尾流程。
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                # 进入一条新的 episode：
+                # - 播报提示
+                # - 调用 record_loop 执行固定时长的控制与录制
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
@@ -553,8 +703,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_compressed_images=display_compressed_images,
                 )
 
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
+                # 一条 episode 结束后，通常要给操作者一点时间恢复场景。
+                # 所以这里会再跑一个“reset 窗口”：
+                # - 依然调用同一个 record_loop
+                # - 但语义上这是 reset，不是正式采样
+                #
+                # 最后一条 episode 后通常不需要 reset，除非用户按了重录键。
                 if not events["stop_recording"] and (
                     (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
                 ):
@@ -573,6 +727,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         display_data=cfg.display_data,
                     )
 
+                # 左键会把刚才录的 episode 标记为无效。
+                # 这里清掉当前 episode buffer，不写盘，然后直接回到 while 顶部重录。
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)
                     events["rerecord_episode"] = False
@@ -580,12 +736,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     dataset.clear_episode_buffer()
                     continue
 
+                # 只有没有被标记为重录时，才真正把当前 episode 提交到磁盘。
                 dataset.save_episode()
                 recorded_episodes += 1
     finally:
+        # finally 的作用是兜底清理：
+        # 无论是正常结束、键盘中断还是异常报错，都会尽量走这条路径。
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
         if dataset:
+            # finalize 会把 dataset 的写入状态收尾，例如刷掉缓冲、关闭资源等。
             dataset.finalize()
 
         if robot.is_connected:
@@ -593,9 +753,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if teleop and teleop.is_connected:
             teleop.disconnect()
 
+        # headless 环境本来就不会启动 pynput listener，所以这里只在非 headless
+        # 场景下尝试 stop。
         if not is_headless() and listener:
             listener.stop()
 
+        # 上传是最后一步，只有本地资源都安全关闭后才做。
         if cfg.dataset.push_to_hub:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
@@ -604,6 +767,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
 
 def main():
+    """CLI 主入口。
+
+    作用很简单：
+    - 先注册第三方插件，确保扩展出来的 robot / policy / env 类型可见
+    - 再进入 `record()`
+    """
     register_third_party_plugins()
     record()
 
