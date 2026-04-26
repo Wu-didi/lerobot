@@ -23,9 +23,9 @@
 
 lerobot-train \
     --dataset.repo_id=zsx/fold_clothes0402 \
-    --dataset.root=/home/wudi/code/lerobot_0.5.1/lerobot/data/eval_test_0415 \
+    --dataset.root=/home/wudi/code/lerobot-0.4.2/data/fold_clothes_merged_all \
     --policy.type=pi05 \
-    --output_dir=outputs/pi05_training_lora_dagger \
+    --output_dir=outputs/pi05_training_lora_dagger_v2 \
     --job_name=pi05_training \
     --policy.repo_id=zsx/pi05 \
     --policy.push_to_hub=false \
@@ -36,7 +36,7 @@ lerobot-train \
     --wandb.enable=false \
     --steps=100000 \
     --policy.device=cuda \
-    --batch_size=16 \
+    --batch_size=2 \
     --log_freq=100 \
     --save_freq=2000 \
     --policy.optimizer_lr=2.5e-4 \

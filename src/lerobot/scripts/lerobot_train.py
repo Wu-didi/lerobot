@@ -56,6 +56,13 @@ from lerobot.utils.utils import (
 )
 
 
+import debugpy
+debugpy.listen(12345)
+print("wait debug")
+debugpy.wait_for_client()
+print("Debugger attached")
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -477,7 +484,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     # 主训练循环：
     # 每一轮做一件事：取一个 batch -> 预处理 -> 更新 policy -> 决定是否日志/保存/评估。
-    for _ in range(step, cfg.steps):
+    for _ in range(step, cfg.steps):  # cfg.steps 是总更新步数，不是 epoch 数。
         start_time = time.perf_counter()
         batch = next(dl_iter)
 

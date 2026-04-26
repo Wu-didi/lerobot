@@ -57,6 +57,18 @@ def _gated_residual(
     gate: torch.Tensor | None,
 ) -> torch.Tensor | None:
     """Gated residual: x + y when gate is None, else x + y * gate."""
+    # 中文说明：
+    # 这是一个带门控的残差连接辅助函数。
+    # 作用：
+    # 1. 当 gate 为 None 时，退化成普通残差相加 `x + y`
+    # 2. 当 gate 存在时，先用 gate 调节新分支 y，再与残差 x 相加
+    # 为什么需要它：
+    # PiGemma / AdaRMS 会额外预测一个 gate，用它控制注意力分支或 MLP 分支
+    # 对主残差流的影响强度。
+    # shape:
+    # x: [B, T, D] or None
+    # y: [B, T, D] or None
+    # gate: [B, D] / [B, T, D] or None, broadcastable to y
     if x is None and y is None:
         return None
     if x is None or y is None:
@@ -76,6 +88,17 @@ def layernorm_forward(
     if cond is not None, use conditional norm
     otherwise, use normal gemma norm
     """
+    # 中文说明：
+    # 统一封装“普通 RMSNorm”和“带条件输入的 AdaRMSNorm”两种调用方式。
+    # 作用：
+    # 1. 如果 cond 不为空，就走条件归一化，额外让 cond 调节 scale/shift/gate
+    # 2. 如果 cond 为空，就退化成普通 Gemma 风格归一化
+    # 为什么单独封装：
+    # 这样上层 decoder layer 不需要关心当前 layernorm 是标准版还是条件版，
+    # 直接统一调用即可。
+    # shape:
+    # x: [B, T, D]
+    # cond: [B, C] or [B, T, C] or None
     if cond is not None:
         return layernorm(x, cond=cond)
     else:
@@ -87,6 +110,15 @@ class PiGemmaRMSNorm(nn.Module):
     Adaptive RMSNorm for PI Gemma (AdaRMS).
     When cond_dim is set, uses cond to modulate scale/shift/gate; otherwise behaves like standard GemmaRMSNorm.
     forward(x, cond=None) returns (output, gate) for use with _gated_residual.
+
+    中文说明：
+    这是 PI Gemma 里的 AdaRMSNorm 实现。
+    它和普通 RMSNorm 的区别是：
+    1. 普通 RMSNorm 只有一个可学习缩放参数
+    2. AdaRMSNorm 还可以接收一个条件向量 cond，再动态产生 scale / shift / gate
+
+    这使得模型可以根据额外条件改变归一化后的激活分布，
+    并把 gate 继续传给后面的 gated residual 使用。
     """
 
     def __init__(self, dim: int, eps: float = 1e-6, cond_dim: int | None = None):
@@ -103,6 +135,10 @@ class PiGemmaRMSNorm(nn.Module):
 
     def _norm(self, x):
         # Compute variance in float32 (like the source implementation)
+        # 中文说明：
+        # 这里只做“纯 RMS 归一化”，不做条件调制。
+        # shape:
+        # x: [B, T, D] or [B, D]
         var = torch.mean(torch.square(x.float()), dim=-1, keepdim=True)
         # Compute normalization in float32
         normed_inputs = x * torch.rsqrt(var + self.eps)
@@ -113,20 +149,29 @@ class PiGemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         cond: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # x: [B, T, D] or [B, D]
+        # cond: [B, C], [B, T, C], or None
         dtype = x.dtype
         normed = self._norm(x)
         if cond is None or self.dense is None:
+            # 无条件模式：退化为普通 RMSNorm，只返回归一化后的输出，不返回 gate。
             normed = normed * (1.0 + self.weight.float())
             return normed.type_as(x), None
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected cond dim {self.cond_dim}, got {cond.shape[-1]}")
         # cond: [B, cond_dim] (global) or [B, T, cond_dim] (per-token, for training-time RTC)
+        # 中文说明：
+        # dense(cond) 会一次性预测 3 组调制量：
+        # scale, shift, gate
+        # 前两者用来调制 norm 输出，最后一个 gate 交给残差连接控制分支强度。
         modulation = self.dense(cond)
         # If x is 3D [B, seq, dim] and cond is 2D (global), unsqueeze modulation to broadcast over seq
         # If cond is already 3D (per-token), modulation is [B, seq, 3*dim] and aligns with x token-wise
         if len(x.shape) == 3 and modulation.ndim == 2:
             modulation = modulation.unsqueeze(1)
+            # modulation: [B, 1, 3D] -> broadcast over sequence length T
         scale, shift, gate = modulation.chunk(3, dim=-1)
+        # scale / shift / gate: [B, T, D] or [B, 1, D]
         normed = normed * (1 + scale.float()) + shift.float()
         return normed.to(dtype), gate.to(dtype)
 
@@ -138,9 +183,22 @@ class PiGemmaRMSNorm(nn.Module):
 
 def _get_pi_gemma_decoder_layer_base():
     """base for PiGemmaDecoderLayer"""
+    # 中文说明：
+    # 这里返回一个内部定义的 decoder layer 类。
+    # 为什么写成函数而不是直接定义类：
+    # 主要是为了延迟绑定 transformers 里的 Gemma 组件，并把本文件的
+    # PiGemmaRMSNorm / gated residual 组合进 Gemma 的标准 decoder 结构。
 
     class _PiGemmaDecoderLayerBase(GradientCheckpointingLayer):
         """Decoder layer that uses PiGemmaRMSNorm and _gated_residual, compatible with v5 Gemma."""
+        # 中文说明：
+        # 这是 PiGemma 的单层 decoder：
+        # 1. input_layernorm: 先归一化并可选地产生 gate
+        # 2. self_attn: 做自注意力
+        # 3. gated residual: 把注意力输出并回残差
+        # 4. post_attention_layernorm: 再归一化并可选地产生新的 gate
+        # 5. mlp: 前馈网络
+        # 6. gated residual: 把 MLP 输出并回残差
 
         def __init__(self, config: GemmaConfig, layer_idx: int):
             super().__init__()
@@ -169,6 +227,10 @@ def _get_pi_gemma_decoder_layer_base():
             adarms_cond: torch.Tensor | None = None,
             **kwargs,
         ) -> torch.Tensor:
+            # hidden_states: [B, T, D]
+            # attention_mask: usually [B, 1, Q, K]
+            # position_ids: [B, T]
+            # adarms_cond: [B, C], [B, T, C], or None
             residual = hidden_states
             hidden_states, gate = self.input_layernorm(hidden_states, cond=adarms_cond)
             hidden_states, _ = self.self_attn(
@@ -182,12 +244,15 @@ def _get_pi_gemma_decoder_layer_base():
                 **kwargs,
             )
 
+            # 这里把注意力分支通过 gate 调节后并回主残差流。
             hidden_states = _gated_residual(residual, hidden_states, gate)
 
             residual = hidden_states
             hidden_states, gate = self.post_attention_layernorm(hidden_states, cond=adarms_cond)
             hidden_states = self.mlp(hidden_states)
+            # MLP 分支也走同样的 gated residual 逻辑。
             hidden_states = _gated_residual(residual, hidden_states, gate)
+            # return: [B, T, D]
             return hidden_states
 
     return _PiGemmaDecoderLayerBase
@@ -196,6 +261,12 @@ def _get_pi_gemma_decoder_layer_base():
 class PiGemmaModel(GemmaModel):  # type: ignore[misc]
     """
     GemmaModel extended with AdaRMS (adaptive RMSNorm) and gated residuals when config.use_adarms is True.
+
+    中文说明：
+    这是把原始 GemmaModel 替换成“PiGemma 版本”的主干。
+    关键变化有两点：
+    1. 每层的 LayerNorm 换成了 PiGemmaRMSNorm，可选支持 AdaRMS
+    2. 残差连接换成了 gated residual，使 cond 不只影响归一化，还能影响分支注入强度
     """
 
     def __init__(self, config: GemmaConfig, **kwargs):
@@ -226,7 +297,17 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
         """
         adarms_cond (`torch.Tensor` of shape `(batch_size, cond_dim)`, *optional*):
             Condition for ADARMS.
+
+        中文说明：
+        这是 PiGemma 的完整 decoder forward。
+        它基本沿用 GemmaModel.forward 的主流程，但把每层替换成了支持 AdaRMS 的版本。
         """
+        # 输入 shape 约定：
+        # input_ids: [B, T] or None
+        # inputs_embeds: [B, T, D] or None
+        # attention_mask: usually [B, T] or already-expanded causal mask metadata
+        # position_ids: [B, T]
+        # adarms_cond: [B, C] or [B, T, C] or None
         output_attentions = (
             output_attentions if output_attentions is not None else self.config.output_attentions
         )
@@ -248,6 +329,7 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+            # input_ids: [B, T] -> inputs_embeds: [B, T, D]
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
@@ -260,6 +342,7 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
+            # cache_position: [T] -> position_ids: [1, T]
 
         causal_mask = create_causal_mask(
             config=self.config,
@@ -269,15 +352,18 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
+        # causal_mask: typically [B, 1, Q, K]
 
         # embed positions
         hidden_states = inputs_embeds
+        # hidden_states: [B, T, D]
         # Convert to bfloat16 if the first layer uses bfloat16
         if len(self.layers) > 0 and self.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
             hidden_states = hidden_states.to(torch.bfloat16)
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # position_embeddings is a tuple of rotary cos/sin tensors shared across layers
 
         # normalized
         # Gemma downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
@@ -305,11 +391,13 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
             )
 
             hidden_states = layer_outputs
+            # hidden_states remains [B, T, D] after each decoder block
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
         hidden_states, _ = self.norm(hidden_states, adarms_cond)
+        # final hidden_states: [B, T, D]
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -327,6 +415,11 @@ class PiGemmaForCausalLM(GemmaForCausalLM):  # type: ignore[misc]
     """
     Causal LM wrapper using PiGemmaModel as the backbone, for consistency with GemmaForCausalLM
     and the language model used in pi0_fast. Use this for the action expert in pi0/pi05.
+
+    中文说明：
+    这是一个薄封装，目的是复用 HuggingFace `GemmaForCausalLM` 的外壳接口，
+    但把里面真正的 decoder backbone 换成 `PiGemmaModel`。
+    在 pi0 / pi05 里，它主要被拿来当动作 expert 使用。
     """
 
     def __init__(self, config: GemmaConfig, **kwargs):
@@ -336,6 +429,9 @@ class PiGemmaForCausalLM(GemmaForCausalLM):  # type: ignore[misc]
 
 class PaliGemmaModelWithPiGemma(PaliGemmaModel):
     """PaliGemmaModel whose language_model is PiGemmaModel (custom decoder with PiGemmaRMSNorm and gated residuals)."""
+    # 中文说明：
+    # 这个类保留了 PaliGemma 的视觉部分和整体多模态结构，
+    # 但把文本 decoder 从标准 Gemma 换成 PiGemmaModel。
 
     def __init__(self, config):
         super().__init__(config)
@@ -344,12 +440,21 @@ class PaliGemmaModelWithPiGemma(PaliGemmaModel):
 
 class PaliGemmaForConditionalGenerationWithPiGemma(PaliGemmaForConditionalGeneration):
     """PaliGemmaForConditionalGeneration using PiGemma decoder for the language model."""
+    # 中文说明：
+    # 这是更外层的 conditional generation 封装。
+    # 作用：
+    # 1. 保持 PaliGemmaForConditionalGeneration 的接口不变
+    # 2. 内部把 `self.model` 替换成使用 PiGemma decoder 的版本
+    # 这样上层代码仍然可以按标准 PaliGemma 风格调用图像特征提取和语言模型前向。
 
     def __init__(self, config):
         super().__init__(config)
         self.model = PaliGemmaModelWithPiGemma(config)
 
     # Make modules available through conditional class for BC
+    # 中文说明：
+    # 为了兼容上层调用方式，这里继续暴露 `.language_model` 属性，
+    # 让外部不需要关心内部 model 被替换过。
     @property
     def language_model(self):
         return self.model.language_model

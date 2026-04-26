@@ -113,7 +113,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             新建数据集请用 :meth:`create`，继续录制请用 :meth:`resume`。
         """
         super().__init__()
-        self.repo_id = repo_id
+        self.repo_id = repo_id  # 'zsx/fold_clothes0402'
         self._requested_root = Path(root) if root else None
         self.image_transforms = image_transforms
         self.delta_timestamps = delta_timestamps

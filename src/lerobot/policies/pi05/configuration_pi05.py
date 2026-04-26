@@ -29,6 +29,16 @@ DEFAULT_IMAGE_SIZE = 224
 @PreTrainedConfig.register_subclass("pi05")
 @dataclass
 class PI05Config(PreTrainedConfig):
+    """
+    Configuration for the PI0.5 policy.
+    PI0.5 策略的配置对象。
+
+    This dataclass defines the model architecture, training hyperparameters,
+    normalization behavior, and RTC-related options used by the pi05 policy.
+    这个 dataclass 统一描述 pi05 使用的模型结构、训练超参数、归一化行为，
+    以及和 RTC / training-time RTC 相关的选项。
+    """
+
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
@@ -102,9 +112,18 @@ class PI05Config(PreTrainedConfig):
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
     def __post_init__(self):
+        """
+        Run post-initialization validation.
+        执行配置的后置校验。
+
+        This hook ensures mutually dependent hyperparameters are consistent
+        before the rest of the policy stack starts using the config.
+        这个钩子会在配置真正进入模型与处理器之前，先检查关键超参数是否互相兼容。
+        """
         super().__post_init__()
 
         # Validate configuration
+        # 校验 action horizon / chunk horizon 的基本关系，避免运行时维度不一致。
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
@@ -126,7 +145,16 @@ class PI05Config(PreTrainedConfig):
                 )
 
     def validate_features(self) -> None:
-        """Validate and set up input/output features."""
+        """
+        Validate and set up input/output features.
+        校验并补齐输入/输出特征定义。
+
+        PI0.5 expects image, state, and action feature specs to exist.
+        If the caller did not provide them explicitly, this method inserts the
+        required default placeholders based on config dimensions.
+        PI0.5 期望输入里至少有图像/状态定义，输出里至少有动作定义。
+        如果外部没有显式给出，这里会按配置里的维度补出默认定义。
+        """
         for i in range(self.empty_cameras):
             key = OBS_IMAGES + f".empty_camera_{i}"
             empty_camera = PolicyFeature(
@@ -150,6 +178,10 @@ class PI05Config(PreTrainedConfig):
             self.output_features[ACTION] = action_feature
 
     def get_optimizer_preset(self) -> AdamWConfig:
+        """
+        Return the optimizer preset used by PI0.5.
+        返回 PI0.5 默认使用的优化器配置。
+        """
         return AdamWConfig(
             lr=self.optimizer_lr,
             betas=self.optimizer_betas,
@@ -159,6 +191,10 @@ class PI05Config(PreTrainedConfig):
         )
 
     def get_scheduler_preset(self):
+        """
+        Return the scheduler preset used by PI0.5.
+        返回 PI0.5 默认使用的学习率调度器配置。
+        """
         return CosineDecayWithWarmupSchedulerConfig(
             peak_lr=self.optimizer_lr,
             decay_lr=self.scheduler_decay_lr,
@@ -168,12 +204,28 @@ class PI05Config(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> None:
+        """
+        PI0.5 does not request stacked observation windows via dataset deltas.
+        PI0.5 默认不通过 dataset delta 机制额外堆叠 observation 时间窗口。
+        """
         return None
 
     @property
     def action_delta_indices(self) -> list:
+        """
+        Return the action horizon as delta indices.
+        以 delta index 形式返回动作 horizon。
+
+        During training, the dataset should expose the entire action chunk
+        ``[0, 1, ..., chunk_size - 1]`` so the policy can supervise the full horizon.
+        训练时数据集需要把完整动作块都暴露出来，模型才能监督整个 action chunk。
+        """
         return list(range(self.chunk_size))
 
     @property
     def reward_delta_indices(self) -> None:
+        """
+        PI0.5 does not consume reward deltas from the dataset.
+        PI0.5 默认不读取 reward 的时序窗口。
+        """
         return None
