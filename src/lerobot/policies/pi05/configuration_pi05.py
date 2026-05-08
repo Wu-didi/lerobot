@@ -64,7 +64,19 @@ class PI05Config(PreTrainedConfig):
     rtc_config: RTCConfig | None = None
 
     # --- Training-Time RTC (arXiv 2512.05964) ---
+    # 普通 action-chunk policy 训练时默认“整段 chunk 都是未知的”，模型从噪声生成完整动作块。
+    # 但真实 RTC 部署时，新的 chunk 生成出来之前，机器人已经在执行上一段 chunk；
+    # 下一段 chunk 的前几个动作往往已经被上一段 chunk 的剩余动作决定。
+    # training_rtc=True 时，训练阶段就模拟这个结构：
+    #   - chunk 前面一小段 token 被当作已知 clean prefix；
+    #   - 模型只需要在这个 prefix 条件下补全后面的 suffix；
+    #   - 这样推理时可以直接把上一块剩余动作塞进当前 chunk，而不是完全依赖 VJP/pinv guidance。
     training_rtc: bool = False  # Enable training-time action conditioning for real-time chunking
+
+    # simulated_delay 是训练时最多模拟多少个“已确定前缀”token。
+    # 实际每个样本会从 {0, ..., simulated_delay - 1} 里采一个 delay；
+    # delay=0 保留普通 flow-matching 样本，delay>0 则表示前 delay 个 token 是 frozen prefix。
+    # 这里和官方 kinetix 实现一致使用指数权重，让较小 delay 更常见，贴近实际推理延迟通常较短的分布。
     simulated_delay: int = 5  # Max prefix delay K; delay sampled from {0,...,K-1} with exp weights
 
     image_resolution: tuple[int, int] = (

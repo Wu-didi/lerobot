@@ -94,6 +94,12 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
     
     这个函数既支持原始 PI0.5 的“每个 batch 一个时间”，
     也支持 training-time RTC 的“每个 token 一个时间”。
+    为什么需要 per-token time：
+    training-time RTC 会让同一个 action chunk 里同时存在两类 token：
+    - frozen prefix 已经是 clean action；
+    - suffix 仍然处在某个 flow-matching 噪声时间 t。
+    如果整个 chunk 只能共享一个 t，模型就无法知道“前缀已经干净、后缀还要去噪”。
+    因此这里允许 time=[B,T]，让每个动作 token 带自己的噪声/干净状态。
     """
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
@@ -1049,7 +1055,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # 为什么需要它：训练要在不同噪声强度/插值位置上监督模型。
             # 它怎么做到：先按 Beta 分布采样，再缩放到配置指定的时间区间。
             # sample_time() samples the flow-matching time value t for each sample.
-            time = self.sample_time(actions.shape[0], actions.device)
+            time = self.sample_time(actions.shape[0], actions.device) # torch.Size([8]) 是batch size的大小
 
         batch_size = actions.shape[0]
         chunk_size = self.config.chunk_size
@@ -1059,18 +1065,34 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # 中文说明：
         # training-time RTC 的核心是“冻结前缀 + 每 token 独立时间”，
         # 而不是额外的外部 guidance。
+        #
+        # 这段代码对应官方 training-time action conditioning 的训练分布：
+        # 给模型看的不是“从零生成整个 chunk”，而是“chunk 开头已经有一段确定动作，
+        # 你需要接着它往后生成”。这样可以把真实部署时的 train-test gap 前移到训练阶段。
+        #
+        # 注意 PI05 的时间方向和官方 kinetix/JAX demo 相反：
+        # - 官方 demo: time=0 是纯噪声，time=1 是 clean action；
+        # - 这里 PI05: x_t = t * noise + (1 - t) * action，所以 time=1 是纯噪声，time=0 是 clean action。
+        # 因此 frozen prefix 的 time 必须设成 0，而不是官方 demo 里的 1。
         if self.config.training_rtc:
-            K = self.config.simulated_delay
+            K = self.config.simulated_delay  # 设置为5 
             # (a) Sample delay ∈ {0,...,K-1} with exp-decaying weights (smaller delays more likely)
+            # delay 表示当前样本里有多少个 token 被当作“上一块 chunk 已经确定的前缀”。
+            # 使用 exp 权重不是为了数学必要性，而是为了让训练分布更像真实部署：
+            # 小延迟/短前缀更常见，大延迟也会偶尔出现，让模型保持鲁棒。
             w = torch.exp(torch.arange(K, device=device).flip(0).float())
             w = w / w.sum()
             delay = torch.multinomial(w.expand(batch_size, -1), num_samples=1).squeeze(-1)  # [B]
 
             # (b) Per-token mask: True = frozen prefix
+            # rtc_mask[i, j]=True 表示第 i 个样本的第 j 个动作 token 是条件输入，
+            # 它不是这一步要学习预测的目标，而是“已知事实”。
             token_indices = torch.arange(chunk_size, device=device).unsqueeze(0)  # [1, T]
             rtc_mask = token_indices < delay.unsqueeze(1)  # [B, T]
 
             # (c) Per-token time: frozen tokens = 0 (clean, PI05 convention), others = sampled t
+            # frozen prefix 被设为 clean action，这样 suffix token 在 attention/mixer 中能看到真实连续的前缀。
+            # suffix 仍然使用普通 flow-matching 的 sampled time，保持原始去噪训练目标。
             time_per_token = torch.where(
                 rtc_mask, torch.zeros_like(time.unsqueeze(1)), time.unsqueeze(1)
             )  # [B, T]
@@ -1078,14 +1100,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # (d) Interpolate with per-token time:
             # At time=0 (frozen): x_t = 0*noise + 1*actions = actions (clean) — automatic
             # At time=t (non-frozen): x_t = t*noise + (1-t)*actions (normal interpolation)
+            # 这里不需要手动 copy actions 到 prefix：只要 time_per_token=0，
+            # 线性插值公式自然会把 frozen prefix 变成干净动作。
             time_expanded = time_per_token.unsqueeze(-1)  # [B, T, 1]
-            x_t = time_expanded * noise + (1 - time_expanded) * actions
+            x_t = time_expanded * noise + (1 - time_expanded) * actions  # torch.Size([8, 50, 32])
             u_t = noise - actions
 
             # (e) Effective time for model forward: [B, T] per-token
+            # effective_time 传给 suffix embedding / AdaRMS conditioning。
+            # 这让模型在同一次 forward 里知道：前缀 token 已经 clean，后缀 token 还处于时间 t。
             effective_time = time_per_token
 
             # Store loss mask for PI05Policy.forward(); 1=active (loss counted), 0=frozen (masked out)
+            # frozen prefix 是条件，不是监督目标；如果也对它算 loss，
+            # 模型会被迫在“答案已经给出”的位置继续拟合速度场，反而污染 suffix 学习。
             self._training_rtc_mask = (~rtc_mask).unsqueeze(-1).float()  # [B, T, 1]
         else:
             time_expanded = time[:, None, None]
@@ -1237,6 +1265,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Training-Time RTC inference: get prefix info from kwargs
         # 从上层拿到上一块动作的尾部和延迟长度，用于当前 chunk 的冻结前缀。
+        #
+        # training_rtc_prev_chunk 的语义：
+        # 它不是额外的 guidance target，而是当前 denoising 输入里“已经确定”的 clean prefix。
+        # 推理时把上一块 chunk 尚未执行完、需要保持连续的动作放到当前 chunk 开头；
+        # 训练时模型已经见过这种“prefix clean + suffix noisy”的分布，所以这里可以直接普通前向，
+        # 不必像传统 RTC 那样每步做 VJP/pinv correction。
         training_rtc_prev_chunk = kwargs.get("training_rtc_prev_chunk")
         training_rtc_delay = kwargs.get("training_rtc_delay", 0)
 
@@ -1256,9 +1290,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             if training_rtc_active:
                 # Hard-replace prefix x_t with previous chunk's actions (clean)
                 # 直接用上一块的干净动作覆盖当前块前缀，这就是 training-time RTC 推理的核心。
+                # 这个替换发生在每个 denoise step 的模型输入前：
+                # - prefix 始终作为 clean 条件提供给模型；
+                # - suffix 保持正常 Euler 去噪状态；
+                # - 模型学到的是“看着确定前缀续写后缀”，而不是“整块动作重新发明一遍”。
                 x_t = torch.where(rtc_token_mask.unsqueeze(-1), training_rtc_prev_chunk, x_t)
                 # Build per-token time: frozen = 0 (clean, PI05 convention), others = current t
                 # 冻结 token 的时间设成 0，表示它已经是 clean action。
+                # 再强调一次时间约定：PI05 这里 time=0 是 clean，time=1 是 noise；
+                # 所以这和官方 kinetix demo 里 frozen time=1 的写法表面不同，但语义一致。
                 time_tensor = torch.full(
                     (bsize, self.config.chunk_size), time, dtype=torch.float32, device=device
                 )
@@ -1769,12 +1809,25 @@ class PI05Policy(PreTrainedPolicy):
         # The prefix length is capped at simulated_delay - 1 to stay within the training
         # distribution (training only sees delays in {0, ..., simulated_delay - 1}).
         # When chunk_size == n_action_steps (no overlap), this block is skipped.
+        #
+        # 为什么用上一块 chunk 的尾部：
+        # action chunk 通常一次预测 T 步，但控制循环可能只执行前 n_action_steps 步就重新规划。
+        # 如果 T > n_action_steps，那么上一块的 [n_action_steps : T) 仍然描述了未来一段动作。
+        # 把这段尾部移到下一块开头，相当于告诉模型：
+        # “这些动作已经由上一次计划确定了，请从这里自然续写。”
+        #
+        # 为什么 cap 到 simulated_delay - 1：
+        # 训练只见过 0 到 simulated_delay-1 个 frozen token。
+        # 推理时如果塞入更长 prefix，会把模型推到没训练过的条件分布外。
         if self.config.training_rtc and self._prev_action_chunk is not None:
             overlap = self.config.chunk_size - self.config.n_action_steps
             inference_delay = min(overlap, self.config.simulated_delay - 1)
             if inference_delay > 0:
                 shift = self.config.n_action_steps
                 shifted_prev = torch.zeros_like(self._prev_action_chunk)
+                # shifted_prev 的前 inference_delay 个 token 对齐到当前 chunk 开头；
+                # 其它 token 保持 0 只是占位，因为 sample_actions 只会根据 training_rtc_delay
+                # 对前缀位置做 hard replacement。
                 shifted_prev[:, :inference_delay] = self._prev_action_chunk[:, shift : shift + inference_delay]
                 kwargs["training_rtc_prev_chunk"] = shifted_prev
                 kwargs["training_rtc_delay"] = inference_delay
@@ -1788,6 +1841,8 @@ class PI05Policy(PreTrainedPolicy):
         # actions from the core model: [B, T=chunk_size, A_pad]
 
         # Store full horizon chunk for next call's prefix (only if user opts into inference RTC)
+        # 这里缓存的是 padded action chunk，和模型内部 action dim 对齐。
+        # 下一次构造 prefix 时也发生在模型内部 padded 空间里，因此先缓存再 unpad。
         if self.config.training_rtc:
             self._prev_action_chunk = actions.detach().clone()
 
@@ -1845,6 +1900,12 @@ class PI05Policy(PreTrainedPolicy):
         if rtc_mask is not None:
             # rtc_mask: [B, T, 1], 1=active, 0=frozen; truncate action dim to match
             # 只有非冻结 token 会参与损失，这正是 training-time RTC 的监督方式。
+            #
+            # 原理：
+            # frozen prefix 在输入 x_t 里已经被设置成 clean action，它的角色是“条件”。
+            # 如果继续在这些位置监督 velocity，相当于要求模型对已知答案再做预测，
+            # 这会把训练信号浪费在 prefix 上，并可能干扰模型学习 suffix 如何接上 prefix。
+            # 所以这里所有统计和最终 loss 都只看 rtc_mask=1 的 active suffix token。
             loss_dict = {
                 "loss_per_dim": (losses * rtc_mask).sum(dim=[0, 1]).detach().cpu()
                 / (rtc_mask.sum(dim=[0, 1]).clamp(min=1e-8)).detach().cpu(),
@@ -1853,6 +1914,8 @@ class PI05Policy(PreTrainedPolicy):
 
             if reduction == "none":
                 # Per-sample masked mean over time and action dims
+                # reduction="none" 用于上层按样本重新加权，例如 RA-BC/DSRL 类训练。
+                # 因此这里保留每个样本一个 loss，但仍然只平均 active suffix token。
                 per_sample_loss = (losses * rtc_mask).sum(dim=(1, 2)) / (
                     rtc_mask.sum(dim=(1, 2)) * original_action_dim + 1e-8
                 )

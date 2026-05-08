@@ -61,19 +61,42 @@ class DSRLPi05Config(PI05Config):
     # advantage 权重上限，防止 exp(temperature * advantage) 数值爆炸。
     iql_adv_clip: float = 100.0
 
-    # actor 输出经过 tanh 后再乘这个幅度，限制 latent noise 落在 pi0.5 训练时更合理的范围。
-    noise_action_magnitude: float = 3.0
+    # latent noise 的可选 clamp 幅度。None 表示完全不裁剪，和 pi0.5 inference 的 sample_noise 行为一致。
+    # DSRL 应该默认工作在 pi0.5 原始高斯 noise space；只有做安全消融时才显式设置 clamp。
+    noise_action_magnitude: float | None = None
 
-    # 每个样本反演 latent noise 的 Adam 优化步数。越大重建更准，但 cache 生成越慢。
+    # 每个样本反演 latent noise 的最大 Adam 优化步数，也就是反演的 max_steps。
+    # 实际运行时如果 patience 早停触发，会提前结束；否则最多跑这么多步。
     latent_inversion_steps: int = 200
+    # 反演早停 patience。连续这么多步重建误差 improvement 小于 min_delta 就停止当前 restart。
+    # 这样已经收敛的样本不会继续浪费 pi0.5 decoder 计算；设为 None 可关闭早停。
+    latent_inversion_patience: int | None = 30
+    # 反演早停的最小改善量。小于这个值视为没有有效进步。
+    latent_inversion_min_delta: float = 1e-5
+    # 反演时 pi0.5 flow decoder 使用的 denoise 步数。None 表示沿用 num_inference_steps。
+    # 反演阶段每个 Adam step 都要跑一次 decoder，所以这里通常应小于正式推理步数，用速度换可接受的 label 精度。
+    latent_inversion_decode_steps: int | None = None
+    # 反演内层优化日志频率。0 表示关闭；大于 0 时每隔这么多 Adam step 打印一次 recon_error/loss。
+    latent_inversion_log_freq: int = 0
     # 多次随机初始化反演，保留重建误差最小的 noise，减少局部最优影响。
     latent_restarts: int = 4
     # 反演时只优化 latent noise，因此学习率可以比普通模型训练高。
     latent_inversion_lr: float = 5e-2
     # L2 正则约束反演出的 noise 不要过大，避免靠异常 latent 勉强重建 demo action。
     latent_reg_weight: float = 1e-4
-    # 重建误差阈值。超过阈值的样本不进入 offline RL 训练，避免错误 latent label 污染 critic。
-    latent_recon_threshold: float = 5e-2
+    # 手动重建误差阈值。None 表示不提前指定阈值，而是在 cache 全部生成后根据 recon_error 分布自动求阈值。
+    # 这样可以先看完整数据分布，再统一决定哪些 noise_label 可信。
+    latent_recon_threshold: float | None = None
+    # 自动阈值使用的 recon_error 分位数。0.95 表示保留重建误差最低的约 0.95 比例样本。
+    latent_recon_quantile: float = 0.95
+    # 自动阈值的可选绝对上限。None 表示只使用分位数；设置后 threshold = min(quantile_threshold, max_threshold)。
+    latent_recon_max_threshold: float | None = None
+    # 是否按 recon_error 对 actor 训练样本再做质量加权。默认关闭，保持第一版训练目标简单。
+    # 开启后 recon_error 越小权重越大，recon_error 接近阈值的样本权重会降低。
+    recon_error_weighting: bool = False
+    # recon_error 质量权重温度：weight = exp(-recon_error / temperature)。
+    # 值越小，训练越偏向重建误差很低的 latent label。
+    recon_error_weight_temperature: float = 5e-2
 
     # 这些 optimizer 字段保留 LeRobot policy 统一接口；实际 IQL 脚本会分别创建 actor/critic/value optimizer。
     optimizer_lr: float = 1e-4
@@ -100,6 +123,18 @@ class DSRLPi05Config(PI05Config):
         # 反演至少要有一步优化，否则无法从 demo action 得到 latent noise label。
         if self.latent_inversion_steps <= 0:
             raise ValueError("latent_inversion_steps must be > 0")
+        # patience 为 None 表示关闭早停；否则必须为正数，0 会让第一步之后就可能错误停止。
+        if self.latent_inversion_patience is not None and self.latent_inversion_patience <= 0:
+            raise ValueError("latent_inversion_patience must be > 0 or None")
+        # min_delta 允许为 0，表示只要误差没有严格下降就累计 patience；负数没有语义。
+        if self.latent_inversion_min_delta < 0:
+            raise ValueError("latent_inversion_min_delta must be >= 0")
+        # decode_steps 为 None 时使用 pi0.5 默认推理步数；显式设置时必须为正。
+        if self.latent_inversion_decode_steps is not None and self.latent_inversion_decode_steps <= 0:
+            raise ValueError("latent_inversion_decode_steps must be > 0 or None")
+        # log_freq=0 表示关闭日志；负数没有语义。
+        if self.latent_inversion_log_freq < 0:
+            raise ValueError("latent_inversion_log_freq must be >= 0")
         # restart 数必须为正，否则没有候选 latent 可以被评估和保存。
         if self.latent_restarts <= 0:
             raise ValueError("latent_restarts must be > 0")
@@ -112,9 +147,9 @@ class DSRLPi05Config(PI05Config):
         # AWR 权重下限固定为 1，因此 clip 小于 1 没有意义。
         if self.awr_weight_clip < 1.0:
             raise ValueError("awr_weight_clip must be >= 1.0")
-        # noise 幅度必须为正，否则 tanh squash 后的 latent action 会退化或翻转语义。
-        if self.noise_action_magnitude <= 0:
-            raise ValueError("noise_action_magnitude must be > 0")
+        # None 表示关闭 clamp；显式设置时必须为正，否则会把 noise 裁成无效范围。
+        if self.noise_action_magnitude is not None and self.noise_action_magnitude <= 0:
+            raise ValueError("noise_action_magnitude must be > 0 or None")
         # expectile 是分位型回归参数，只在 (0, 1) 内有定义。
         if not 0 < self.iql_expectile < 1:
             raise ValueError("iql_expectile must be in (0, 1)")
@@ -124,6 +159,18 @@ class DSRLPi05Config(PI05Config):
         # advantage clip 必须为正，否则 actor 权重会被错误裁成非正数。
         if self.iql_adv_clip <= 0:
             raise ValueError("iql_adv_clip must be > 0")
+        # 手动阈值为 None 时走自动分位数；如果用户显式给阈值，则必须为正。
+        if self.latent_recon_threshold is not None and self.latent_recon_threshold <= 0:
+            raise ValueError("latent_recon_threshold must be > 0 or None")
+        # 分位数必须在 (0, 1] 内；1.0 表示只过滤超过最大误差上限的样本。
+        if not 0 < self.latent_recon_quantile <= 1:
+            raise ValueError("latent_recon_quantile must be in (0, 1]")
+        # 自动阈值上限为 None 时关闭；显式设置时必须为正。
+        if self.latent_recon_max_threshold is not None and self.latent_recon_max_threshold <= 0:
+            raise ValueError("latent_recon_max_threshold must be > 0 or None")
+        # recon_error 质量权重使用 exp(-error / temperature)，temperature 必须为正。
+        if self.recon_error_weight_temperature <= 0:
+            raise ValueError("recon_error_weight_temperature must be > 0")
         # 三个 optimizer 都实际参与训练，所以都要在配置阶段检查。
         if self.actor_lr <= 0 or self.critic_lr <= 0 or self.value_lr <= 0:
             raise ValueError("actor_lr, critic_lr, and value_lr must be > 0")

@@ -41,11 +41,11 @@ from lerobot.utils.logging_utils import AverageMeter
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import init_logging
 
-import debugpy
-debugpy.listen(12345)
-print("wait debug")
-debugpy.wait_for_client()
-print("Debugger attached")
+# import debugpy
+# debugpy.listen(12345)
+# print("wait debug")
+# debugpy.wait_for_client()
+# print("Debugger attached")
 
 @dataclass
 class DSRLOfflineDatasetConfig:
@@ -144,8 +144,18 @@ def main(cfg: DSRLOfflineCacheConfig) -> None:
 
     # 先构建数据集，后续 policy factory 需要 dataset.meta 来补全 feature 信息。
     dataset = make_lerobot_dataset(cfg)
-    # query_stride 决定一个 episode 中哪些 frame 会作为 latent decision step。
+    # 离线 DSRL 训练的 action 不是单步机器人动作，而是 pi0.5 flow 的 latent noise chunk。
+    # pi0.5 每次根据一个 observation 生成一段 action chunk，机器人会连续执行其中的 n_action_steps 步；
+    # 因此 RL 里的一个 transition 应该对应“一次 latent decision”，而不是数据集里的每一帧。
+    # 如果每一帧都反演 noise，会产生大量高度重叠的 action chunk，训练样本看似变多，
+    # 但实际信息重复、cache 生成更慢，reward/done 也更难和 chunk 执行边界对齐。
+    # query_stride 就是 latent decision 的抽样间隔：默认等于 n_action_steps，
+    # 表示执行完上一段 chunk 后，再在新的 frame 上重新选择下一段 latent noise。
     query_stride = resolve_query_stride(cfg.policy.query_stride, cfg.policy.n_action_steps)
+    # candidate_indices_by_episode 保存每条 episode 中可以作为 latent decision 起点的 dataset index。
+    # 后续会用这些 index 构造 (s, z, r, s', done)：当前 index 是 s，
+    # 同一 episode 里的下一个 candidate index 是 s'，最后一个 candidate index 对应 terminal。
+    # 同时还要保证从该 index 开始能取到完整 chunk_size 的未来动作，否则无法反演完整 noise label。
     candidate_indices_by_episode = build_episode_candidate_indices(
         dataset=dataset,
         chunk_size=cfg.policy.chunk_size,
@@ -159,6 +169,10 @@ def main(cfg: DSRLOfflineCacheConfig) -> None:
         failed_episodes=set(cfg.dataset.failed_episodes),
         assume_all_success=cfg.dataset.assume_all_success,
     )
+    # success_by_episode 是一个 dict，key 是 episode index，value 是 bool 成败标签。
+    # 例如：{0: True, 1: False, ...}。
+    # 第一版折衣服数据集没有 success_feature，所以默认所有 episode 都是成功示范；
+    # 如果后续混入失败数据，可以通过 failed_episodes 明确指定哪些 episode 失败。
     # reward_table 存储 dataset_index、next_dataset_index、reward、done、return_to_go。
     reward_table = build_sparse_reward_table(
         candidate_indices_by_episode=candidate_indices_by_episode,
@@ -195,7 +209,6 @@ def main(cfg: DSRLOfflineCacheConfig) -> None:
     tensor_lists = {
         "noise_label": [],
         "recon_error": [],
-        "is_valid": [],
         "absolute_index": [],
         "task_index": [],
     }
@@ -214,8 +227,6 @@ def main(cfg: DSRLOfflineCacheConfig) -> None:
         target_actions = processed_batch[ACTION]
         # 核心步骤：固定 pi0.5 decoder，优化 latent noise 来重建 demo action。
         noise_label, recon_error = policy.invert_actions_to_noise(processed_batch, target_actions)
-        # 重建误差过大的样本会在训练 dataset 中被过滤掉，避免错误 latent label 污染 Q。
-        is_valid = recon_error <= cfg.policy.latent_recon_threshold
 
         for key, value in reward_table.items():
             # reward_table 顺序和 Subset(dataset, candidate_indices) 顺序一致，所以用 offset 对齐。
@@ -224,22 +235,17 @@ def main(cfg: DSRLOfflineCacheConfig) -> None:
         # noise_label 展平成 `[B, latent_action_dim]`，方便训练时直接送入 MLP critic。
         tensor_lists["noise_label"].append(noise_label.reshape(batch_size, -1).detach().cpu())
         tensor_lists["recon_error"].append(recon_error.detach().cpu())
-        tensor_lists["is_valid"].append(is_valid.detach().cpu())
         tensor_lists["absolute_index"].append(raw_batch["index"].detach().cpu().to(dtype=torch.int64))
         tensor_lists["task_index"].append(raw_batch["task_index"].detach().cpu().to(dtype=torch.int64))
 
         offset += batch_size
         recon_meter.update(recon_error.mean().item(), n=batch_size)
-        valid_count = int(torch.cat(tensor_lists["is_valid"]).sum().item())
         if tb_writer is not None:
-            # 这些指标用于判断反演质量：重建误差越低、valid_ratio 越高，cache 越可靠。
+            # 这些指标用于判断反演质量；valid_ratio 要等全量 recon_error 统计完并确定阈值后再计算。
             tb_writer.add_scalar("precompute/recon_error", recon_error.mean().item(), offset)
             tb_writer.add_scalar("precompute/recon_error_avg", recon_meter.avg, offset)
-            tb_writer.add_scalar("precompute/valid_samples", valid_count, offset)
-            tb_writer.add_scalar("precompute/valid_ratio", valid_count / offset, offset)
         progress.set_postfix(
             recon_error=f"{recon_meter.avg:.5f}",
-            valid=valid_count,
             total=offset,
         )
 
@@ -252,6 +258,40 @@ def main(cfg: DSRLOfflineCacheConfig) -> None:
         if len(values) == 0:
             raise ValueError("Offline cache generation did not produce any samples.")
         cache_tensors[key] = torch.cat(values, dim=0)
+
+    # 先完成所有样本反演，再基于全量 recon_error 分布统一求阈值。
+    # 这样 threshold 来自当前数据集自己的反演质量，而不是预先拍一个固定值。
+    recon_errors = cache_tensors["recon_error"].to(dtype=torch.float32)
+    if cfg.policy.latent_recon_threshold is None:
+        quantile_threshold = torch.quantile(recon_errors, cfg.policy.latent_recon_quantile)
+        resolved_threshold = quantile_threshold
+        threshold_source = "auto_quantile"
+        if cfg.policy.latent_recon_max_threshold is not None:
+            # 可选绝对上限用于防止整体反演都很差时，分位数阈值被异常抬得过高。
+            max_threshold = torch.tensor(
+                cfg.policy.latent_recon_max_threshold,
+                dtype=resolved_threshold.dtype,
+                device=resolved_threshold.device,
+            )
+            resolved_threshold = torch.minimum(resolved_threshold, max_threshold)
+            threshold_source = "auto_quantile_with_max"
+    else:
+        quantile_threshold = torch.quantile(recon_errors, cfg.policy.latent_recon_quantile)
+        resolved_threshold = torch.tensor(cfg.policy.latent_recon_threshold, dtype=torch.float32)
+        threshold_source = "manual"
+
+    # is_valid 是最后统一生成的硬过滤结果；训练时 OfflineDSRLLatentDataset 只保留 True 样本。
+    cache_tensors["is_valid"] = recon_errors <= resolved_threshold
+
+    recon_error_quantiles = {
+        "recon_error_min": recon_errors.min(),
+        "recon_error_p50": torch.quantile(recon_errors, 0.50),
+        "recon_error_p75": torch.quantile(recon_errors, 0.75),
+        "recon_error_p90": torch.quantile(recon_errors, 0.90),
+        "recon_error_p95": torch.quantile(recon_errors, 0.95),
+        "recon_error_p99": torch.quantile(recon_errors, 0.99),
+        "recon_error_max": recon_errors.max(),
+    }
 
     # 只用 valid 样本统计 return，AWR fallback 和日志才不会被无效反演样本污染。
     valid_returns = cache_tensors["return_to_go"][cache_tensors["is_valid"]]
@@ -270,12 +310,23 @@ def main(cfg: DSRLOfflineCacheConfig) -> None:
         "query_stride": query_stride,
         "base_policy_path": str(cfg.policy.base_policy_path) if cfg.policy.base_policy_path is not None else None,
         "discount": cfg.policy.discount,
-        "latent_recon_threshold": cfg.policy.latent_recon_threshold,
+        "latent_inversion_steps": cfg.policy.latent_inversion_steps,
+        "latent_inversion_patience": cfg.policy.latent_inversion_patience,
+        "latent_inversion_min_delta": cfg.policy.latent_inversion_min_delta,
+        "latent_inversion_decode_steps": cfg.policy.latent_inversion_decode_steps,
+        "latent_inversion_log_freq": cfg.policy.latent_inversion_log_freq,
+        "latent_recon_threshold": float(resolved_threshold.item()),
+        "latent_recon_threshold_source": threshold_source,
+        "latent_recon_quantile": cfg.policy.latent_recon_quantile,
+        "latent_recon_quantile_threshold": float(quantile_threshold.item()),
+        "latent_recon_max_threshold": cfg.policy.latent_recon_max_threshold,
         "num_total_samples": int(cache_tensors["dataset_index"].numel()),
         "num_valid_samples": int(cache_tensors["is_valid"].sum().item()),
+        "valid_ratio": float(cache_tensors["is_valid"].to(dtype=torch.float32).mean().item()),
         "return_to_go_mean": float(return_mean.item()),
         "return_to_go_std": float(return_std.item()),
     }
+    metadata.update({key: float(value.item()) for key, value in recon_error_quantiles.items()})
 
     # safetensors 写 tensor，JSON 写可读元信息；训练脚本只依赖这两个文件。
     save_dsrl_offline_cache(cfg.output_dir, cache_tensors, metadata)
@@ -283,6 +334,9 @@ def main(cfg: DSRLOfflineCacheConfig) -> None:
         # 末尾再写一次总量指标，方便 TensorBoard 上快速确认 cache 规模。
         tb_writer.add_scalar("precompute/num_total_samples", metadata["num_total_samples"], offset)
         tb_writer.add_scalar("precompute/num_valid_samples", metadata["num_valid_samples"], offset)
+        tb_writer.add_scalar("precompute/valid_ratio", metadata["valid_ratio"], offset)
+        tb_writer.add_scalar("precompute/latent_recon_threshold", metadata["latent_recon_threshold"], offset)
+        tb_writer.add_scalar("precompute/recon_error_p95", metadata["recon_error_p95"], offset)
         tb_writer.add_scalar("precompute/return_to_go_mean", metadata["return_to_go_mean"], offset)
         tb_writer.add_scalar("precompute/return_to_go_std", metadata["return_to_go_std"], offset)
         tb_writer.close()

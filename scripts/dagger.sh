@@ -42,15 +42,18 @@ python examples/hil/hil_data_collection.py \
  --teleop.left_arm_port=/dev/ttyACM1 \
  --teleop.right_arm_port=/dev/ttyACM2 \
  --teleop.id=bimanual_leader \
- --policy.path=/media/wudi/f/wudi/lerobot/pi05_training_dagger/012000/pretrained_model \
+ --policy.path=/media/wudi/f/wudi/lerobot/pi05_training_dagger/012000/pretrained_model  \
  --policy.push_to_hub=false \
  --dataset.repo_id=zsx/eval_fold_clothes \
- --dataset.root=data/eval_test_04151 \
+ --dataset.root=data/eval_test_0504 \
  --dataset.single_task="Fold the T-shirt that's on the table." \
  --dataset.fps=30 \
  --dataset.episode_time_s=2000 \
  --dataset.num_episodes=500 \
  --dataset.push_to_hub=false \
  --display_data=false \
- --interpolation_multiplier=3 
-#  --resume=true 
+ --interpolation_multiplier=3 \
+ --resume=true 
+  #  --policy.path=/home/wudi/code/lerobot-0.4.2/data/pi05_training_dagger_0429/016000/pretrained_model \
+  #  --policy.path=/media/wudi/f/wudi/lerobot/pi05_training_dagger/012000/pretrained_model \
+  # /media/wudi/f/wudi/lerobot/pi05_training_v2/checkpoints/008000/pretrained_model

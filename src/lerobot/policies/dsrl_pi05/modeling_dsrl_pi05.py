@@ -34,6 +34,20 @@ from lerobot.policies.pretrained import ActionSelectKwargs, PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
 
+def _safe_tqdm_write(message: str) -> None:
+    """在 tqdm 进度条存在时安全打印一行日志。
+
+    precompute 脚本外层已经有 tqdm；直接 print 会破坏进度条显示。
+    这里优先用 tqdm.write，没有 tqdm 时再退回普通 print。
+    """
+    try:
+        from tqdm import tqdm
+
+        tqdm.write(message)
+    except Exception:
+        print(message)
+
+
 def _build_mlp(input_dim: int, hidden_dims: list[int], output_dim: int) -> nn.Sequential:
     """构建 actor、critic 或 value 使用的小型 MLP head。
 
@@ -252,9 +266,24 @@ class DSRLPi05Policy(PreTrainedPolicy):
             return noise
         raise ValueError(f"Expected noise tensor with rank 2 or 3, got shape {tuple(noise.shape)}")
 
-    def _squash_noise(self, noise: Tensor) -> Tensor:
-        """把 raw actor/latent 参数限制到 pi0.5 合理的 noise 幅度内。"""
-        return self.config.noise_action_magnitude * torch.tanh(noise)
+    def _project_noise(self, noise: Tensor) -> Tensor:
+        """把 noise 保持在 pi0.5 原始高斯 latent space，并可选做宽松裁剪。
+
+        pi0.5 推理时初始 noise 来自标准高斯 `sample_noise()`，不是 tanh-squashed 动作。
+        因此这里不做 tanh，只在配置了 `noise_action_magnitude` 时做 clamp，防止优化或 actor
+        输出极端离群值。
+        """
+        if self.config.noise_action_magnitude is None:
+            return noise
+        return noise.clamp(-self.config.noise_action_magnitude, self.config.noise_action_magnitude)
+
+    def _sample_pi05_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
+        """复用 pi0.5 的标准高斯 noise 初始化函数。
+
+        这样 action-to-noise 反演的初始点和 pi0.5 原始推理阶段完全一致：
+        都是 `[B, chunk_size, max_action_dim]` 形状的 N(0, 1) latent noise。
+        """
+        return self.base_policy.model.sample_noise(shape, device)
 
     def flatten_noise(self, noise: Tensor) -> Tensor:
         """把 chunk 形状的 noise 展平成 critic 可以拼接的向量。"""
@@ -383,9 +412,10 @@ class DSRLPi05Policy(PreTrainedPolicy):
 
     def predict_noise_from_features(self, obs_features: Tensor) -> Tensor:
         """从缓存好的观测特征出发运行 actor，输出 latent noise。"""
-        # actor 先输出 unconstrained latent，再用 tanh 限幅，避免生成 pi0.5 未见过的极端 noise。
+        # actor 直接输出 pi0.5 原始 noise space 里的 latent action；
+        # 只做可选 clamp，不做 tanh squash，保持和 pi0.5 sample_noise 语义一致。
         actor_output = self.actor(obs_features)
-        return self._squash_noise(actor_output).view(-1, self.config.chunk_size, self.config.max_action_dim)
+        return self._project_noise(actor_output).view(-1, self.config.chunk_size, self.config.max_action_dim)
 
     def critic_forward(self, obs_features: Tensor, noise: Tensor) -> tuple[Tensor, Tensor]:
         """计算一个 state-latent-action 对应的 twin Q 值。"""
@@ -404,6 +434,18 @@ class DSRLPi05Policy(PreTrainedPolicy):
         """把 IQL advantage 转成 actor 回归 demo latent action 的样本权重。"""
         # advantage 越高，说明该 demo latent action 比当前 V(s) 更好，actor 应该更用力拟合。
         return torch.exp(self.config.iql_temperature * advantage).clamp(max=self.config.iql_adv_clip)
+
+    def compute_recon_quality_weights(self, recon_error: Tensor) -> Tensor:
+        """把 action-to-noise 的重建误差转换成可选的样本质量权重。
+
+        valid/invalid 是硬过滤：超过 threshold 的样本直接丢弃。
+        quality weight 是软加权：已经 valid 的样本中，recon_error 越小，说明 noise_label
+        越能被 frozen pi0.5 解码回 demo action，因此 actor 拟合时可以给更高权重。
+        """
+        recon_error = recon_error.reshape(-1).to(dtype=torch.float32)
+        # exp(-error / temperature) 的范围在 (0, 1]，error=0 时权重为 1。
+        # clamp_min 避免极小权重导致 batch 权重和接近 0，引起 loss 归一化不稳定。
+        return torch.exp(-recon_error / self.config.recon_error_weight_temperature).clamp_min(1e-6)
 
     def compute_actor_loss_from_features(
         self,
@@ -463,10 +505,16 @@ class DSRLPi05Policy(PreTrainedPolicy):
             target_v = self.value_forward(next_obs_features)
             td_target = reward + (1.0 - done) * self.config.discount * target_v
 
-        # 两个 critic 都拟合同一个 TD target，后续取 min 可以降低过估计。
-        critic_loss = F.mse_loss(q1, td_target) + F.mse_loss(q2, td_target)
+        # 两个 critic 都拟合同一个 TD target，这是 twin-Q 版 IQL 的常见写法。
+        # 注意这里用“平均”而不是“直接求和”：两者优化目标方向一致，但求和会把
+        # critic 梯度规模放大 2 倍，等价于隐式提高 critic learning rate，不利于调参。
+        critic1_loss = F.mse_loss(q1, td_target)
+        critic2_loss = F.mse_loss(q2, td_target)
+        critic_loss = 0.5 * (critic1_loss + critic2_loss)
         loss_dict = {
             "critic_loss": critic_loss.item(),
+            "critic1_loss": critic1_loss.item(),
+            "critic2_loss": critic2_loss.item(),
             "target_q_mean": td_target.mean().item(),
             "q1_mean": q1.mean().item(),
             "q2_mean": q2.mean().item(),
@@ -504,6 +552,7 @@ class DSRLPi05Policy(PreTrainedPolicy):
         self,
         obs_features: Tensor,
         behavior_noise: Tensor,
+        sample_weight: Tensor | None = None,
     ) -> tuple[Tensor, dict]:
         """计算 IQL actor loss，即 advantage-weighted latent behavior cloning。
 
@@ -517,6 +566,12 @@ class DSRLPi05Policy(PreTrainedPolicy):
             value = self.value_forward(obs_features)
             advantage = torch.minimum(q1, q2) - value
             actor_weight = self.compute_iql_actor_weights(advantage)
+            if sample_weight is not None:
+                # 可选 recon_error 质量权重只改变 actor 对 noise_label 的拟合强度，
+                # 不改变 critic/value 的 Bellman 目标。
+                actor_weight = actor_weight * sample_weight.to(
+                    device=actor_weight.device, dtype=actor_weight.dtype
+                ).reshape(-1)
 
         loss, loss_dict = self.compute_actor_loss_from_features(
             obs_features=obs_features,
@@ -543,14 +598,32 @@ class DSRLPi05Policy(PreTrainedPolicy):
 
         离线数据只有 action，没有 latent noise；DSRL 需要在 latent space 训练 actor/critic，
         所以先固定 pi0.5 decoder，通过优化 noise 让解码后的动作重建 demo action。
+        换句话说，这里求解的是下面这个优化问题：
+
+            noise_label = argmin_z MSE(pi0.5_decode(observation, z), demo_action)
+
+        这样做的原因是：dsrl_pi0 的在线版本在 rollout 时本来就知道 SAC 采样出来的 noise，
+        replay buffer 可以直接存 noise；但你的离线折衣服数据只保存了机器人真实 action，
+        没保存当时的 pi0.5 noise。因此第一阶段必须先把 action 反投影回 pi0.5 的 latent space，
+        后续 IQL/AWR 才能把这个 noise 当作 RL action 来训练 Q(s, z)、V(s) 和 actor(s)->z。
         """
+        # target_actions 是数据集中真实执行/示范的 action chunk。
+        # 反演过程中只把它当监督目标，不对 action 本身做优化。
         target_actions = target_actions.to(dtype=torch.float32)
-        # 同一个观测下会反复解码不同 noise，先构建 prefix cache 能显著减少反演开销。
+        # 反演阶段每个 Adam step 都要调用一次 pi0.5 decoder。
+        # 如果不单独指定 num_steps，就使用配置里的 latent_inversion_decode_steps；
+        # 它通常比正式推理的 num_inference_steps 小很多，用来把 cache 生成时间控制在可接受范围。
+        if num_steps is None:
+            num_steps = self.config.latent_inversion_decode_steps
+        # 对同一个 observation，会在多个优化 step、多个 restart 中反复尝试不同 noise。
+        # observation 的图像/语言/state prefix 不变，因此先构建 prefix KV cache。
+        # 这样每次只需要跑 action suffix 的 denoising，避免重复编码视觉语言上下文。
         prefix_pad_masks, past_key_values = self._build_prefix_cache(batch)
         batch_size = target_actions.shape[0]
         device = target_actions.device
 
-        # best_noise/best_error 保存多次 restart 中每个样本的最优反演结果。
+        # best_noise 保存当前 batch 中每个样本目前找到的最优 noise label。
+        # 初始化为 0 只是占位；真正返回前会被各个 restart 中误差更小的 candidate 覆盖。
         best_noise = torch.zeros(
             batch_size,
             self.config.chunk_size,
@@ -558,42 +631,106 @@ class DSRLPi05Policy(PreTrainedPolicy):
             device=device,
             dtype=torch.float32,
         )
+        # best_error 记录每个样本最小的重建误差。
+        # 用 inf 初始化，保证第一个 restart 的结果一定会被接受。
         best_error = torch.full((batch_size,), torch.inf, device=device, dtype=torch.float32)
 
-        for _ in range(self.config.latent_restarts):
-            # 每个 restart 从随机 latent 开始，降低局部最优导致 label 质量差的概率。
-            latent = nn.Parameter(
-                torch.randn(
-                    batch_size,
-                    self.config.chunk_size,
-                    self.config.max_action_dim,
-                    device=device,
-                    dtype=torch.float32,
-                )
+        for restart_idx in range(self.config.latent_restarts):
+            # flow/diffusion decoder 从 noise 到 action 的映射不是线性的，也不保证是单峰优化问题。
+            # 同一个 demo action 附近可能存在多个可行 noise，随机初始化可能落到不同局部最优。
+            # 因此做多次 restart，最后按重建误差选择最好的 noise label。
+            # 初始化必须复用 pi0.5 的 sample_noise，使反演起点和原始 pi0.5 推理一致。
+            initial_noise = self._sample_pi05_noise(
+                (batch_size, self.config.chunk_size, self.config.max_action_dim),
+                device,
             )
+            latent = nn.Parameter(
+                initial_noise.to(device=device, dtype=torch.float32)
+            )
+            # 这里只优化 latent 这个“输入变量”，不优化 pi0.5 模型参数。
+            # 目的不是让 base policy 学 demo，而是为每条 demo 找一个能被当前 base policy 解码的 noise 标签。
             optimizer = torch.optim.Adam([latent], lr=self.config.latent_inversion_lr)
 
+            # patience 早停只控制当前 restart 的优化长度，不改变 max_steps 上限。
+            # best_restart_error 记录 batch 平均重建误差的历史最好值；
+            # steps_without_improvement 记录连续多少步没有超过 min_delta 的有效改善。
+            best_restart_error = torch.tensor(torch.inf, device=device)
+            steps_without_improvement = 0
             for _step in range(self.config.latent_inversion_steps):
                 optimizer.zero_grad(set_to_none=True)
-                # 优化变量是 raw latent；squash 后才交给 pi0.5 decoder，保持 noise 幅度受控。
-                noise = self._squash_noise(latent)
+                # latent 就是要优化的 pi0.5 初始 noise，本身来自标准高斯初始化。
+                # 这里不再 tanh squash，否则 noise label 会偏离 pi0.5 原始 noise 分布；
+                # 只做可选 clamp，防止优化过程中出现极端离群值。
+                # noise 的形状是 [batch_size, chunk_size, max_action_dim]，对应一个完整 action chunk 的 latent。
+                noise = self._project_noise(latent)
+                # fixed observation + current noise -> predicted action chunk。
+                # 这里调用的是冻结的 pi0.5 flow decoder，因此梯度会从 action 重建误差传回 noise/latent，
+                # 但不会更新 pi0.5 的权重。
                 predicted_actions = self._decode_noise_from_prefix_cache(
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     noise=noise,
                     num_steps=num_steps,
                 )
-                # 重建误差衡量当前 noise 能否解释 demo action。
+                # 重建误差衡量“当前 noise 能不能解释这条 demo action”。
+                # reduction="none" 后再按 chunk/action 维度求均值，是为了保留 batch 内每个样本自己的误差。
+                # 这些 per-sample error 后面会用于过滤无效 cache 样本。
                 recon_error = F.mse_loss(predicted_actions, target_actions, reduction="none").mean(dim=(1, 2))
-                # L2 正则避免用异常大的 latent noise 勉强拟合动作。
+                # L2 正则避免 optimizer 通过极端 noise 勉强拟合 action。
+                # 如果没有这个约束，反演可能得到 pi0.5 正常采样分布之外的 z，
+                # 后续 actor 学这种 z 会更难泛化，critic 的 Q(s,z) 也更容易不稳定。
                 regularizer = noise.square().mean(dim=(1, 2))
+                # batch 内取均值后反传，这样一次 backward 可以同时优化 batch 中所有样本的 latent。
                 loss = (recon_error + self.config.latent_reg_weight * regularizer).mean()
                 loss.backward()
                 optimizer.step()
 
+                if self.config.latent_inversion_log_freq > 0 and (
+                    _step == 0
+                    or (_step + 1) % self.config.latent_inversion_log_freq == 0
+                    or _step == self.config.latent_inversion_steps - 1
+                ):
+                    # 低频输出反演内层优化状态，用来判断 recon_error 是否在下降。
+                    # 这里只打印 batch 统计，不打印每个样本，避免日志过大。
+                    _safe_tqdm_write(
+                        "[latent inversion] "
+                        f"restart={restart_idx + 1}/{self.config.latent_restarts} "
+                        f"step={_step + 1}/{self.config.latent_inversion_steps} "
+                        f"loss={loss.detach().item():.6f} "
+                        f"recon_mean={recon_error.detach().mean().item():.6f} "
+                        f"recon_min={recon_error.detach().min().item():.6f} "
+                        f"recon_max={recon_error.detach().max().item():.6f} "
+                        f"reg={regularizer.detach().mean().item():.6f}"
+                    )
+
+                # 早停判断使用 batch 平均 recon_error，而不是带正则的 loss。
+                # 原因是 noise_label 的有效性最终由 recon_error < threshold 决定，
+                # 所以停止条件应该直接观察动作重建质量是否还在明显改善。
+                current_error = recon_error.detach().mean()
+                improvement = best_restart_error - current_error
+                if improvement > self.config.latent_inversion_min_delta:
+                    best_restart_error = current_error
+                    steps_without_improvement = 0
+                else:
+                    steps_without_improvement += 1
+                if (
+                    self.config.latent_inversion_patience is not None
+                    and steps_without_improvement >= self.config.latent_inversion_patience
+                ):
+                    # 最近 patience 步都没有明显改善，继续跑到 max_steps 大概率只会浪费时间。
+                    if self.config.latent_inversion_log_freq > 0:
+                        _safe_tqdm_write(
+                            "[latent inversion] "
+                            f"restart={restart_idx + 1}/{self.config.latent_restarts} "
+                            f"early_stop_step={_step + 1} "
+                            f"best_recon_mean={best_restart_error.detach().item():.6f}"
+                        )
+                    break
+
             with torch.no_grad():
-                # restart 结束后再评估一次，把 batch 内每个样本的最好候选独立保留下来。
-                candidate_noise = self._squash_noise(latent)
+                # 一个 restart 结束后，再用最终 latent 评估一次 candidate。
+                # 这里 no_grad 是因为已经不需要继续优化，只做选择和保存。
+                candidate_noise = self._project_noise(latent)
                 predicted_actions = self._decode_noise_from_prefix_cache(
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
@@ -601,10 +738,16 @@ class DSRLPi05Policy(PreTrainedPolicy):
                     num_steps=num_steps,
                 )
                 candidate_error = F.mse_loss(predicted_actions, target_actions, reduction="none").mean(dim=(1, 2))
+                # better 是按样本比较，而不是要求整个 batch 同时变好。
+                # 这样 batch 中第 0 个样本可以选择 restart A，第 1 个样本可以选择 restart B。
                 better = candidate_error < best_error
                 best_error = torch.where(better, candidate_error, best_error)
+                # better[:, None, None] 把 `[B]` mask 扩展到 `[B, chunk_size, max_action_dim]`，
+                # 对每个样本独立替换完整 noise chunk。
                 best_noise = torch.where(better[:, None, None], candidate_noise.detach(), best_noise)
 
+        # 返回的 best_noise 会写入 cache 作为 noise_label；
+        # best_error 会写入 recon_error，用 latent_recon_threshold 判断这个 label 是否可信。
         return best_noise, best_error
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
@@ -626,6 +769,10 @@ class DSRLPi05Policy(PreTrainedPolicy):
         else:
             # 没有 RL 权重时就是普通 latent BC。
             sample_weight = None
+        if self.config.recon_error_weighting and "recon_error" in batch:
+            # 可选质量加权：valid 样本仍然全部可训练，但重建误差更小的 noise_label 权重更高。
+            recon_weight = self.compute_recon_quality_weights(batch["recon_error"]).to(target_noise.device)
+            sample_weight = recon_weight if sample_weight is None else sample_weight.to(recon_weight.device) * recon_weight
 
         if reduction == "none":
             # 有些通用评估代码需要逐样本 loss，因此保留不聚合分支。

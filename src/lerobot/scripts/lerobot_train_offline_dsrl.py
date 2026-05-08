@@ -40,6 +40,13 @@ from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import init_logging
 
 
+import debugpy
+debugpy.listen(12345)
+print("wait debug")
+debugpy.wait_for_client()
+print("Debugger attached")
+
+
 @dataclass
 class DSRLOfflineTrainConfig:
     """离线 DSRL / latent IQL 训练脚本配置。"""
@@ -76,7 +83,7 @@ def make_lerobot_dataset_from_cache(
     cache 只保存索引和 latent label，不复制原始图像/state；
     因此训练时需要回到同一个 dataset root，用 cache 里的 dataset_index 取样本。
     """
-    dataset_root = cache_metadata.get("dataset_root")
+    dataset_root = cache_metadata.get("dataset_root")  # '/home/wudi/code/lerobot-0.4.2/data/fold_clothes_merged_all'
     # metadata 里记录了 repo_id/root/revision，保证训练读取的是生成 cache 时同一份数据。
     ds_meta = LeRobotDatasetMetadata(
         cache_metadata["dataset_repo_id"],
@@ -204,10 +211,17 @@ def main(cfg: DSRLOfflineTrainConfig) -> None:
             # reward/done 来自 sparse reward table，是 RL 后训练信号。
             reward = labels["reward"].to(policy.config.device)
             done = labels["done"].to(policy.config.device, dtype=torch.float32)
+            recon_quality_weight = None
+            if policy.config.recon_error_weighting:
+                # 可选质量加权：OfflineDSRLLatentDataset 已经丢弃 is_valid=False 的样本；
+                # 这里进一步在 valid 样本内部按 recon_error 做软加权，重建越准权重越高。
+                recon_quality_weight = policy.compute_recon_quality_weights(
+                    labels["recon_error"].to(policy.config.device)
+                )
 
             # 冻结 pi0.5 编码观测；后续三个 head 都复用同一份特征。
-            obs_features = policy._encode_observation_context(processed_batch)
-            next_obs_features = policy._encode_observation_context(next_processed_batch)
+            obs_features = policy._encode_observation_context(processed_batch)  # torch.Size([8, 2048])
+            next_obs_features = policy._encode_observation_context(next_processed_batch) # torch.Size([8, 2048])
 
             # 第一步：critic 拟合 r + gamma * V(s')，学习 latent action 的长期价值。
             critic_optimizer.zero_grad(set_to_none=True)
@@ -246,6 +260,7 @@ def main(cfg: DSRLOfflineTrainConfig) -> None:
                 actor_loss, actor_dict = policy.compute_iql_actor_loss(
                     obs_features=obs_features,
                     behavior_noise=behavior_noise,
+                    sample_weight=recon_quality_weight,
                 )
             else:
                 # AWR fallback：不依赖 critic/value 的 advantage，直接用 return-to-go 加权 BC。
@@ -256,6 +271,12 @@ def main(cfg: DSRLOfflineTrainConfig) -> None:
                     mean=policy.return_to_go_mean,
                     std=policy.return_to_go_std,
                 )
+                if recon_quality_weight is not None:
+                    # AWR 权重表达“这条轨迹回报高不高”，recon_quality_weight 表达“noise label 靠不靠谱”。
+                    # 两者相乘后，actor 更偏向高回报且反演质量好的样本。
+                    sample_weight = sample_weight * recon_quality_weight.to(
+                        device=sample_weight.device, dtype=sample_weight.dtype
+                    )
                 actor_loss, actor_dict = policy.compute_actor_loss_from_features(
                     obs_features=obs_features,
                     target_noise=behavior_noise,
@@ -284,6 +305,8 @@ def main(cfg: DSRLOfflineTrainConfig) -> None:
                 tb_writer.add_scalar("train/value_grad_norm", value_grad_norm.item(), step)
                 tb_writer.add_scalar("train/reward_mean", reward.mean().item(), step)
                 tb_writer.add_scalar("train/done_mean", done.mean().item(), step)
+                if recon_quality_weight is not None:
+                    tb_writer.add_scalar("train/recon_quality_weight_mean", recon_quality_weight.mean().item(), step)
 
             if step % cfg.log_freq == 0 or step == 1:
                 # tqdm/logging 只打印滑动 actor loss 和当前 critic/value，避免每步刷屏。

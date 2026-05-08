@@ -56,11 +56,11 @@ from lerobot.utils.utils import (
 )
 
 
-import debugpy
-debugpy.listen(12345)
-print("wait debug")
-debugpy.wait_for_client()
-print("Debugger attached")
+# import debugpy
+# debugpy.listen(12345)
+# print("wait debug")
+# debugpy.wait_for_client()
+# print("Debugger attached")
 
 
 def update_policy(

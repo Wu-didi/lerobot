@@ -18,6 +18,8 @@ set -e
 # -m lerobot.scripts.lerobot_train_offline_dsrl：运行离线 DSRL/IQL 训练入口。
 # --policy.base_policy_path：同一个 base pi0.5 权重路径；训练时仍然冻结 base，只训练 actor/critic/value head。
 # --policy.device：训练使用的设备；这里用 cuda 在 GPU 上编码观测并训练 DSRL head。
+# --policy.recon_error_weighting：是否启用 recon_error 质量加权；默认 false 时只使用 valid 硬过滤。
+# --policy.recon_error_weight_temperature：质量加权温度；越小越偏向 recon_error 更低的 noise_label。
 # --cache_dir：cache 目录；必须已经存在 dsrl_offline_cache.safetensors 和 dsrl_offline_cache.json。
 # --output_dir：训练输出目录；会保存中间 checkpoint、final checkpoint、TensorBoard event 和训练状态 JSON。
 # --batch_size：offline RL 训练 batch size；越大梯度越稳定但显存占用越高。
@@ -29,9 +31,11 @@ set -e
 PYTHONPATH=src /home/wudi/miniconda3/envs/lerobot/bin/python -m lerobot.scripts.lerobot_train_offline_dsrl \
     --policy.base_policy_path=/media/wudi/f/wudi/lerobot/pi05_training_dagger/012000/pretrained_model \
     --policy.device=cuda \
+    --policy.recon_error_weighting=false \
+    --policy.recon_error_weight_temperature=0.05 \
     --cache_dir=outputs/dsrl/fold_clothes_cache \
     --output_dir=outputs/dsrl/fold_clothes_iql \
-    --batch_size=8 \
+    --batch_size=2 \
     --num_workers=0 \
     --steps=10000 \
     --log_freq=50 \

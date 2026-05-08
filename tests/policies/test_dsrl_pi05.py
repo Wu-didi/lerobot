@@ -40,6 +40,7 @@ class DummyBasePI05Policy(nn.Module):
                 ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(action_dim,)),
             },
         )
+        self.model = SimpleNamespace(sample_noise=lambda shape, device: torch.randn(*shape, device=device))
 
 
 def make_test_config() -> DSRLPi05Config:
@@ -55,7 +56,7 @@ def make_test_config() -> DSRLPi05Config:
         latent_restarts=1,
         latent_inversion_lr=0.2,
         latent_reg_weight=0.0,
-        noise_action_magnitude=2.0,
+        noise_action_magnitude=None,
     )
     config.input_features = {
         OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(4,)),

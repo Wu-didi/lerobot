@@ -164,6 +164,12 @@ class PiGemmaRMSNorm(nn.Module):
         # dense(cond) 会一次性预测 3 组调制量：
         # scale, shift, gate
         # 前两者用来调制 norm 输出，最后一个 gate 交给残差连接控制分支强度。
+        #
+        # 为什么这里要允许 cond=[B,T,C]：
+        # training-time RTC 下，同一个 action chunk 里的 prefix token 是 clean，
+        # suffix token 仍处在当前 denoising time。每个 token 的时间条件不同，
+        # AdaRMS 的 scale/shift/gate 也必须逐 token 对齐；否则所有 token 共享一个调制量，
+        # 模型就分不清“这个 token 是已知前缀”还是“这个 token 还需要去噪”。
         modulation = self.dense(cond)
         # If x is 3D [B, seq, dim] and cond is 2D (global), unsqueeze modulation to broadcast over seq
         # If cond is already 3D (per-token), modulation is [B, seq, 3*dim] and aligns with x token-wise

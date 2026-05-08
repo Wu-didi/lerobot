@@ -47,6 +47,7 @@ class DummyBasePI05Policy(nn.Module):
                 ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(action_dim,)),
             },
         )
+        self.model = SimpleNamespace(sample_noise=lambda shape, device: torch.randn(*shape, device=device))
 
 
 def _make_policy_config() -> DSRLPi05Config:
